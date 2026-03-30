@@ -37,6 +37,13 @@ TRACKED_POST_TTL_SEC = 3 * 24 * 3600
 POSTS_PAGE_SIZE = 10
 
 
+def _menu_prepend(base: str, prepend: Optional[str]) -> str:
+    """Строка обратной связи (ошибка/успех) над телом меню после inline-действия."""
+    if prepend and prepend.strip():
+        return f"{prepend.strip()}\n\n{base}"
+    return base
+
+
 class MoscowFormatter(logging.Formatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         dt = datetime.fromtimestamp(record.created, MOSCOW_TZ)
@@ -2344,7 +2351,6 @@ class MaxBot:
                 ct = b.get("channel_title") or f"id {cid}"
                 cct = b.get("comments_chat_title") or f"id {ccid}"
                 lines.append(rep.channel_list_line(i, ct, cid, cct, ccid))
-        text = "\n".join(lines)
         buttons: List[List[Dict]] = [[{"type": "callback", "text": rep.BTN_ADD_CHANNEL, "payload": "usr_add_ch"}]]
         for b in bindings:
             cid = int(b["channel_id"])
@@ -2353,13 +2359,28 @@ class MaxBot:
                 [{"type": "callback", "text": label, "payload": f"usr_ch_detail:{cid}"}]
             )
         buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": "usr_menu"}])
-        await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
+        text = _menu_prepend("\n".join(lines), prepend)
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
 
-    async def send_channel_detail_submenu(self, user_id: int, channel_id: int) -> None:
+    async def send_channel_detail_submenu(
+        self,
+        user_id: int,
+        channel_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+    ) -> None:
         b = self.config.binding_for_channel(channel_id)
         if not b or not self.can_access_channel(user_id, b):
-            await self.send_message(user_id, rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS)
-            await self.send_channels_submenu(user_id)
+            await self.send_channels_submenu(
+                user_id,
+                edit_message_id=edit_message_id,
+                prepend=rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+            )
             return
         cid = int(b["channel_id"])
         ccid = int(b["comments_chat_id"])
