@@ -44,7 +44,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 
-COPY bot.py replies.py .
+COPY *.py .
 
 EXPOSE 8000
 
