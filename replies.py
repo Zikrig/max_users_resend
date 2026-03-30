@@ -19,8 +19,6 @@ BTN_ADD_DELEGATE = "Добавить админа"
 BTN_ADD_MASTER = "Добавить мастера"
 BTN_CHANGE_TEXT = "Изменить текст"
 BTN_CHANGE_LINK = "Изменить ссылку"
-BTN_CHAT_ENTRY_TEXT = "Текст: вход в чат"
-BTN_MSG_LINK_TEXT = "Текст: к сообщению"
 BTN_MUTE = "Mute"
 BTN_POSTS = "Посты"
 BTN_DELETE = "Удалить"
@@ -224,6 +222,26 @@ MASTER_BTNS_SUBMENU = (
     "Текст кнопки входа в чат: {chat_btn}\n"
     "Текст кнопки к сообщению: {msg_btn}"
 )
+
+
+def master_btns_inline_labels(chat_btn: str, msg_btn: str) -> tuple[str, str]:
+    """Подписи inline-кнопок — те же тексты, что в блоке выше (сокращение для длинных строк)."""
+
+    def one(prefix: str, value: str, total_max: int = 64) -> str:
+        t = (value or "").strip() or "—"
+        head = prefix + ": "
+        room = total_max - len(head)
+        if room < 6:
+            room = 6
+        if len(t) > room:
+            t = t[: room - 1] + "…"
+        return head + t
+
+    return (
+        one("Вход в чат", chat_btn),
+        one("К сообщению", msg_btn),
+    )
+
 
 MASTER_LIST_HEADER = "Мастер-админы (хранятся в config.json, не в .env)."
 MASTER_LIST_LINE = "Список: {items}"

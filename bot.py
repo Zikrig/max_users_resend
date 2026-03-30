@@ -1301,11 +1301,11 @@ class MaxBot:
             return False
 
     def get_standard_buttons(self, include_ad: bool = True) -> List[List[Dict]]:
-        """Реклама: callback для учёта кликов; открытие ссылки — в личном ответе бота после нажатия."""
+        """Реклама: inline-кнопка type=link — переход по URL сразу (как у кнопок под постом)."""
         buttons: List[List[Dict]] = []
         if include_ad and self.config.ad_text and self.config.ad_url:
             buttons.append(
-                [{"type": "callback", "text": self.config.ad_text, "payload": "mst_ad_click"}]
+                [{"type": "link", "text": self.config.ad_text, "url": (self.config.ad_url or "").strip()}]
             )
         return buttons
 
@@ -2299,9 +2299,13 @@ class MaxBot:
         edit_message_id: Optional[str] = None,
         prepend: Optional[str] = None,
     ) -> None:
+        chat_lbl, msg_lbl = rep.master_btns_inline_labels(
+            self.config.comments_chat_text,
+            self.config.comments_message_button_text,
+        )
         buttons = [
-            [{"type": "callback", "text": rep.BTN_CHAT_ENTRY_TEXT, "payload": "mst_set_chtxt"}],
-            [{"type": "callback", "text": rep.BTN_MSG_LINK_TEXT, "payload": "mst_set_msgbtn"}],
+            [{"type": "callback", "text": chat_lbl, "payload": "mst_set_chtxt"}],
+            [{"type": "callback", "text": msg_lbl, "payload": "mst_set_msgbtn"}],
             [{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}],
         ]
         text = _menu_prepend(
