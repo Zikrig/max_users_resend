@@ -1209,14 +1209,16 @@ class MaxBot:
         text: str,
         *,
         edit_message_id: Optional[str] = None,
+        attachments: Optional[List[Dict]] = None,
     ) -> None:
-        """Запрос ввода без клавиатуры: правит сообщение с меню, убирая кнопки."""
+        """Запрос ввода: правит сообщение; по умолчанию без клавиатуры, можно передать (например «Назад»)."""
+        att = attachments if attachments is not None else []
         if edit_message_id:
-            ok = await self.edit_message(edit_message_id, text, attachments=[])
+            ok = await self.edit_message(edit_message_id, text, attachments=att)
             if ok:
                 return
             logger.warning("Не удалось заменить сообщение на запрос ввода mid=%s", edit_message_id)
-        await self.send_message(user_id, text)
+        await self.send_message(user_id, text, att)
 
     async def edit_message(
         self,
@@ -2807,7 +2809,45 @@ class MaxBot:
                 return
             self.mute_range_channel_id[sender_id] = mcid
             self.admin_states[sender_id] = AdminState.AWAITING_MUTE_RANGE
-            await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_MUTE_RANGE, edit_message_id=callback_mid)
+            mute_back_kb = [
+                {
+                    "type": "inline_keyboard",
+                    "payload": {
+                        "buttons": [
+                            [
+                                {
+                                    "type": "callback",
+                                    "text": rep.BTN_BACK,
+                                    "payload": f"usr_mute_range_cancel:{mcid}",
+                                }
+                            ]
+                        ]
+                    },
+                }
+            ]
+            await self.replace_with_prompt_or_send(
+                sender_id,
+                rep.PROMPT_MUTE_RANGE,
+                edit_message_id=callback_mid,
+                attachments=mute_back_kb,
+            )
+        elif isinstance(payload, str) and payload.startswith("usr_mute_range_cancel:"):
+            raw_id = payload.split(":", 1)[1]
+            try:
+                ccancel = int(raw_id)
+            except ValueError:
+                return
+            bc = self.config.binding_for_channel(ccancel)
+            if not bc or not self.can_access_channel(sender_id, bc):
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+                )
+                return
+            self.admin_states[sender_id] = AdminState.NONE
+            self.mute_range_channel_id.pop(sender_id, None)
+            await self.send_chat_mute_submenu(sender_id, ccancel, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_rm_del:"):
             raw_admin_id = payload.split(":", 1)[1]
             try:
