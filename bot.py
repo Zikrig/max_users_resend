@@ -2352,17 +2352,7 @@ class MaxBot:
                 ccid = b["comments_chat_id"]
                 ct = b.get("channel_title") or f"id {cid}"
                 cct = b.get("comments_chat_title") or f"id {ccid}"
-                inv = str(b.get("comments_chat_link") or "").strip()
-                lines.append(
-                    rep.channel_list_line(
-                        i,
-                        ct,
-                        int(cid),
-                        cct,
-                        int(ccid),
-                        comments_url=inv or None,
-                    )
-                )
+                lines.append(rep.channel_list_line(i, ct, int(cid), cct, int(ccid)))
         buttons: List[List[Dict]] = [[{"type": "callback", "text": rep.BTN_ADD_CHANNEL, "payload": "usr_add_ch"}]]
         for b in bindings:
             cid = int(b["channel_id"])
@@ -2376,7 +2366,6 @@ class MaxBot:
             user_id,
             text,
             [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
-            text_format="markdown",
             edit_message_id=edit_message_id,
         )
 
@@ -2399,8 +2388,7 @@ class MaxBot:
         ccid = int(b["comments_chat_id"])
         ct = b.get("channel_title") or f"id {cid}"
         cct = b.get("comments_chat_title") or f"id {ccid}"
-        inv = str(b.get("comments_chat_link") or "").strip()
-        text = rep.channel_detail_text(ct, cid, cct, ccid, comments_url=inv or None)
+        text = rep.channel_detail_text(ct, cid, cct, ccid)
         buttons = [
             [{"type": "callback", "text": rep.BTN_MUTE, "payload": f"usr_ch_mute:{cid}"}],
             [{"type": "callback", "text": rep.BTN_POSTS, "payload": f"usr_ch_posts:{cid}:0"}],
@@ -2411,7 +2399,6 @@ class MaxBot:
             user_id,
             text,
             [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
-            text_format="markdown",
             edit_message_id=edit_message_id,
         )
 
@@ -2446,6 +2433,7 @@ class MaxBot:
         channel_id: int,
         *,
         edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
     ) -> None:
         b = self.config.binding_for_channel(channel_id)
         if not b or not self.can_access_channel(user_id, b):
@@ -2465,7 +2453,7 @@ class MaxBot:
             [{"type": "callback", "text": rep.BTN_BACK, "payload": f"usr_ch_detail:{channel_id}"}],
         ]
         current = qh or rep.MUTE_RANGE_NOT_SET
-        text = rep.mute_submenu_text(title, mute_en, current)
+        text = _menu_prepend(rep.mute_submenu_text(title, mute_en, current), prepend)
         await self.show_menu_or_edit(
             user_id,
             text,
