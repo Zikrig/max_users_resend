@@ -44,6 +44,18 @@ def _menu_prepend(base: str, prepend: Optional[str]) -> str:
     return base
 
 
+def _mst_btns_prompt_back_keyboard() -> List[Dict]:
+    """Назад в подменю «Кнопки в посте» с промпта ввода текста кнопок."""
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [[{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_btns"}]]
+            },
+        }
+    ]
+
+
 class MoscowFormatter(logging.Formatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         dt = datetime.fromtimestamp(record.created, MOSCOW_TZ)
@@ -2486,6 +2498,12 @@ class MaxBot:
             elif payload == "mst_ad":
                 await self.send_master_ad_submenu(sender_id, edit_message_id=callback_mid)
             elif payload == "mst_btns":
+                st = self.admin_states.get(sender_id, AdminState.NONE)
+                if st in (
+                    AdminState.AWAITING_CHAT_TEXT,
+                    AdminState.AWAITING_COMMENTS_MESSAGE_BUTTON_TEXT,
+                ):
+                    self.admin_states[sender_id] = AdminState.NONE
                 await self.send_master_btns_submenu(sender_id, edit_message_id=callback_mid)
             elif payload == "mst_stats":
                 await self.show_menu_or_edit(
@@ -2540,10 +2558,20 @@ class MaxBot:
                 )
             elif payload == "mst_set_chtxt":
                 self.admin_states[sender_id] = AdminState.AWAITING_CHAT_TEXT
-                await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_CHAT_BTN, edit_message_id=callback_mid)
+                await self.replace_with_prompt_or_send(
+                    sender_id,
+                    rep.PROMPT_CHAT_BTN,
+                    edit_message_id=callback_mid,
+                    attachments=_mst_btns_prompt_back_keyboard(),
+                )
             elif payload == "mst_set_msgbtn":
                 self.admin_states[sender_id] = AdminState.AWAITING_COMMENTS_MESSAGE_BUTTON_TEXT
-                await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_MSG_BTN, edit_message_id=callback_mid)
+                await self.replace_with_prompt_or_send(
+                    sender_id,
+                    rep.PROMPT_MSG_BTN,
+                    edit_message_id=callback_mid,
+                    attachments=_mst_btns_prompt_back_keyboard(),
+                )
             return
 
         if not self.can_use_user_menu(sender_id):
