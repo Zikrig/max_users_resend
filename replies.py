@@ -58,11 +58,9 @@ def stats_line_short(n: int) -> str:
 # --- Меню (заголовки) ---
 USER_MENU_INTRO = (
     "Добро пожаловать.\n"
-    "У вас есть канал в Max, но нет комментариев? Наш бот вам поможет!\n"
-    "Просто создайте чат комментариев, добавьте бота админом в этот чат и в ваш канал, а затем привяжите его в нашем боте.\n"
-    "Вы можете добавлять админов (другие аккаунты в Max) чтобы они могли управлять вашими каналами.\n"
-    "Если вы хотите иногда отключать комментарии (например по ночам) - добавьте подходящий временной интервал в режим Mure и включите его.\n"
-    "Желаем удачи!"
+    "\n"
+    "У вас есть канал в Max, но нет комментариев? Наш бот вам поможет!\n\n"
+    "Здесь вы можете привязать чаты комментариев ко всем вашим каналам, а также настроить Mute-режим и изменять посты.\n"
 
 )
 
@@ -191,16 +189,54 @@ CHANNELS_DELEGATED_HINT = "{emoji} — канал добавлен не вами
 CHANNELS_EMPTY = "Пока ничего не подключено — нажмите «Добавить канал»."
 
 
-def channel_list_line(n: int, ct: str, cid: int, cct: str, ccid: int) -> str:
-    return f"{n}. {ct} ({cid}) → {cct} ({ccid})"
+def max_chat_open_url(chat_id: int) -> str:
+    """Публичная ссылка на чат/канал в MAX (как в ссылках на сообщения)."""
+    return f"https://max.ru/c/{int(chat_id)}"
 
 
-def channel_detail_text(ct: str, cid: int, cct: str, ccid: int) -> str:
+def _md_link_label(label: str) -> str:
+    """Текст подписи к ссылке: скобки [] ломают markdown — заменяем."""
+    return label.replace("[", "⟨").replace("]", "⟩")
+
+
+def md_link(label: str, url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return label
+    return f"[{_md_link_label(label)}]({u})"
+
+
+def channel_list_line(
+    n: int,
+    ct: str,
+    cid: int,
+    cct: str,
+    ccid: int,
+    *,
+    channel_url: str | None = None,
+    comments_url: str | None = None,
+) -> str:
+    cu = (channel_url or "").strip() or max_chat_open_url(cid)
+    chu = (comments_url or "").strip() or max_chat_open_url(ccid)
+    left = md_link(ct, cu)
+    right = md_link(cct, chu)
+    return f"{n}. {left} → {right}"
+
+
+def channel_detail_text(
+    ct: str,
+    cid: int,
+    cct: str,
+    ccid: int,
+    *,
+    channel_url: str | None = None,
+    comments_url: str | None = None,
+) -> str:
+    cu = (channel_url or "").strip() or max_chat_open_url(cid)
+    chu = (comments_url or "").strip() or max_chat_open_url(ccid)
     return (
-        f"Канал: {ct}\n"
-        f"channel_id: {cid}\n\n"
-        f"Чат комментариев: {cct}\n"
-        f"comments_chat_id: {ccid}"
+        f"Канал: {md_link(ct, cu)}\n\n"
+        f"Чат комментариев: {md_link(cct, chu)}"
     )
 
 

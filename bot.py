@@ -2352,7 +2352,17 @@ class MaxBot:
                 ccid = b["comments_chat_id"]
                 ct = b.get("channel_title") or f"id {cid}"
                 cct = b.get("comments_chat_title") or f"id {ccid}"
-                lines.append(rep.channel_list_line(i, ct, cid, cct, ccid))
+                inv = str(b.get("comments_chat_link") or "").strip()
+                lines.append(
+                    rep.channel_list_line(
+                        i,
+                        ct,
+                        int(cid),
+                        cct,
+                        int(ccid),
+                        comments_url=inv or None,
+                    )
+                )
         buttons: List[List[Dict]] = [[{"type": "callback", "text": rep.BTN_ADD_CHANNEL, "payload": "usr_add_ch"}]]
         for b in bindings:
             cid = int(b["channel_id"])
@@ -2366,6 +2376,7 @@ class MaxBot:
             user_id,
             text,
             [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            text_format="markdown",
             edit_message_id=edit_message_id,
         )
 
@@ -2388,7 +2399,8 @@ class MaxBot:
         ccid = int(b["comments_chat_id"])
         ct = b.get("channel_title") or f"id {cid}"
         cct = b.get("comments_chat_title") or f"id {ccid}"
-        text = rep.channel_detail_text(ct, cid, cct, ccid)
+        inv = str(b.get("comments_chat_link") or "").strip()
+        text = rep.channel_detail_text(ct, cid, cct, ccid, comments_url=inv or None)
         buttons = [
             [{"type": "callback", "text": rep.BTN_MUTE, "payload": f"usr_ch_mute:{cid}"}],
             [{"type": "callback", "text": rep.BTN_POSTS, "payload": f"usr_ch_posts:{cid}:0"}],
@@ -2399,6 +2411,7 @@ class MaxBot:
             user_id,
             text,
             [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            text_format="markdown",
             edit_message_id=edit_message_id,
         )
 
