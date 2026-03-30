@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
+import replies as rep
 import uvicorn
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -34,7 +35,6 @@ API_BASE = "https://platform-api.max.ru"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 TRACKED_POST_TTL_SEC = 3 * 24 * 3600
 POSTS_PAGE_SIZE = 10
-DELEGATED_CHANNEL_EMOJI = "⤴ "
 
 
 class MoscowFormatter(logging.Formatter):
@@ -87,6 +87,28 @@ def parse_listen_host_port(raw: str) -> Tuple[str, int]:
     except ValueError:
         raise ValueError(f"Некорректный порт в WEBHOOK_LISTEN: {raw!r}") from None
     return host, port
+
+
+def _mid_from_message_dict(msg: Any) -> Optional[str]:
+    if not isinstance(msg, dict):
+        return None
+    body = msg.get("body")
+    if isinstance(body, dict):
+        raw = body.get("mid")
+        if raw is not None:
+            return str(raw)
+    return None
+
+
+def message_mid_from_callback_update(update: Dict[str, Any]) -> Optional[str]:
+    """Идентификатор сообщения бота с нажатой inline-кнопкой (редактирование через PUT /messages)."""
+    cb = update.get("callback")
+    if isinstance(cb, dict):
+        for key in ("message", "message_update"):
+            mid = _mid_from_message_dict(cb.get(key))
+            if mid:
+                return mid
+    return _mid_from_message_dict(update.get("message"))
 
 
 async def max_subscribe_webhook(client: httpx.AsyncClient, url: str, secret: Optional[str]) -> None:
@@ -1101,9 +1123,9 @@ class MaxBot:
         return sorted(k for k, v in self.config.delegate_parent.items() if v == user_id)
 
     def channel_label_for_user(self, user_id: int, b: Dict[str, Any]) -> str:
-        base = str(b.get("channel_title") or f"Канал {b['channel_id']}")[:60]
+        base = str(b.get("channel_title") or rep.channel_title_fallback(int(b["channel_id"])))[:60]
         if int(b["created_by"]) != int(user_id):
-            return DELEGATED_CHANNEL_EMOJI + base
+            return rep.DELEGATED_CHANNEL_EMOJI + base
         return base
 
     def binding_in_quiet_hours(self, binding: Dict[str, Any]) -> bool:
@@ -1149,6 +1171,45 @@ class MaxBot:
         except Exception as e:
             logger.error("Failed to send message to %s: %s", chat_id, e)
             return None
+
+    async def show_menu_or_edit(
+        self,
+        user_id: int,
+        text: str,
+        attachments: Optional[List[Dict]] = None,
+        *,
+        text_format: Optional[str] = None,
+        markup: Optional[List[Dict[str, Any]]] = None,
+        edit_message_id: Optional[str] = None,
+    ) -> None:
+        """Меню с клавиатурой: при нажатии кнопки правит то же сообщение, иначе отправляет новое."""
+        if edit_message_id:
+            ok = await self.edit_message(
+                edit_message_id,
+                text,
+                attachments,
+                text_format=text_format,
+                markup=markup,
+            )
+            if ok:
+                return
+            logger.warning("Не удалось отредактировать сообщение mid=%s, отправляем новое", edit_message_id)
+        await self.send_message(user_id, text, attachments, text_format=text_format, markup=markup)
+
+    async def replace_with_prompt_or_send(
+        self,
+        user_id: int,
+        text: str,
+        *,
+        edit_message_id: Optional[str] = None,
+    ) -> None:
+        """Запрос ввода без клавиатуры: правит сообщение с меню, убирая кнопки."""
+        if edit_message_id:
+            ok = await self.edit_message(edit_message_id, text, attachments=[])
+            if ok:
+                return
+            logger.warning("Не удалось заменить сообщение на запрос ввода mid=%s", edit_message_id)
+        await self.send_message(user_id, text)
 
     async def edit_message(
         self,
@@ -1324,7 +1385,7 @@ class MaxBot:
                 r.raise_for_status()
                 data = r.json()
             except Exception as e:
-                return None, None, f"Не удалось получить список чатов: {e}"
+                return None, None, rep.chat_list_fetch_error(str(e))
             chats = data.get("chats") or []
             if not isinstance(chats, list):
                 chats = []
@@ -1345,21 +1406,18 @@ class MaxBot:
                 marker = int(next_m)
             except (TypeError, ValueError):
                 break
-        return None, None, (
-            "Чат не найден среди чатов бота. Добавьте бота в канал/чат по этой ссылке, "
-            "затем повторите ввод."
-        )
+        return None, None, rep.CHAT_NOT_IN_BOT_LIST
 
     async def resolve_chat_from_input(self, text: str) -> tuple[Optional[int], Optional[Dict[str, Any]], str]:
         raw = text.strip()
         if not raw:
-            return None, None, "Пустой ввод."
+            return None, None, rep.EMPTY_INPUT
         maybe_id = try_parse_chat_id_from_text(raw)
         if maybe_id is not None:
             info = await self.fetch_chat_by_id(maybe_id)
             if info:
                 return maybe_id, info, ""
-            return None, None, f"Чат с id={maybe_id} не найден или бот не состоит в нём."
+            return None, None, rep.chat_not_found_by_id(maybe_id)
         if not raw.startswith("http"):
             raw = "https://" + raw.lstrip("/")
         return await self.find_chat_by_invite_url(raw)
@@ -1376,11 +1434,11 @@ class MaxBot:
                     r.status_code,
                     snippet,
                 )
-                return None, f"Не удалось проверить права бота (HTTP {r.status_code})."
+                return None, rep.membership_http_error(r.status_code)
             data = r.json()
             if not isinstance(data, dict):
                 logger.warning("GET /chats/%s/members/me: unexpected JSON type %s", chat_id, type(data))
-                return None, "Некорректный ответ API при проверке прав."
+                return None, rep.MEMBERSHIP_BAD_RESPONSE
             logger.info(
                 "members/me chat_id=%s membership=%s",
                 chat_id,
@@ -1448,11 +1506,7 @@ class MaxBot:
             return
 
         if sender_id is not None and (chat_id is None or chat_id not in public_ids):
-            await self.send_message(
-                sender_id,
-                "Этот бот только для администраторов аккаунтов и мастер-админов. "
-                "Обратитесь к владельцу или отправьте /start после того, как вас добавят.",
-            )
+            await self.send_message(sender_id, rep.GUEST_NO_ACCESS)
 
     async def process_channel_post(self, msg: Dict[str, Any]) -> None:
         message_id = msg.get("body", {}).get("mid")
@@ -1576,16 +1630,12 @@ class MaxBot:
             return tl == name or tl.startswith(name + "@")
 
         if not self.can_use_user_menu(sender_id):
-            await self.send_message(
-                sender_id,
-                "Доступ к боту есть только у мастер-админов и участников аккаунтов. "
-                "Попросите владельца добавить вас делегатом.",
-            )
+            await self.send_message(sender_id, rep.ACCESS_DENIED)
             return
 
         if _cmd("/admin"):
             if not self.is_master(sender_id):
-                await self.send_message(sender_id, "Команда /admin только для мастер-админов.")
+                await self.send_message(sender_id, rep.MASTER_ONLY_ADMIN_CMD)
                 return
             self._reset_fsm(sender_id)
             await self.send_master_menu(sender_id)
@@ -1593,12 +1643,9 @@ class MaxBot:
 
         if _cmd("/stats"):
             if not self.is_master(sender_id):
-                await self.send_message(sender_id, "Команда /stats только для мастер-админов.")
+                await self.send_message(sender_id, rep.MASTER_ONLY_STATS_CMD)
                 return
-            await self.send_message(
-                sender_id,
-                f"Переходов по рекламной кнопке (учёт callback): {self.config.ad_click_total}",
-            )
+            await self.send_message(sender_id, rep.stats_line_callback_total(self.config.ad_click_total))
             return
 
         if _cmd("/start") or treat_as_start:
@@ -1617,12 +1664,12 @@ class MaxBot:
         )
         if state in master_states and not self.is_master(sender_id):
             self._reset_fsm(sender_id)
-            await self.send_message(sender_id, "Сессия ввода сброшена (нужны права мастера).")
+            await self.send_message(sender_id, rep.SESSION_MASTER_RESET)
             return
 
         if state == AdminState.AWAITING_NEW_PROMOTED_MASTER and not self.is_master_env(sender_id):
             self.admin_states[sender_id] = AdminState.NONE
-            await self.send_message(sender_id, "Только мастер из .env может добавлять мастеров в конфиг.")
+            await self.send_message(sender_id, rep.ONLY_ENV_ADDS_MASTERS)
             await self.send_master_menu(sender_id)
             return
 
@@ -1630,18 +1677,18 @@ class MaxBot:
             self.config.ad_text = text
             self.config.save()
             self.admin_states[sender_id] = AdminState.NONE
-            await self.send_message(sender_id, f"Текст рекламы изменен: {text}")
+            await self.send_message(sender_id, rep.AD_TEXT_CHANGED.format(text=text))
             await self.send_master_ad_submenu(sender_id)
             return
 
         if state == AdminState.AWAITING_AD_LINK:
             if not text.startswith("http://") and not text.startswith("https://"):
-                await self.send_message(sender_id, "Ссылка должна начинаться с http:// или https://")
+                await self.send_message(sender_id, rep.AD_LINK_INVALID)
                 return
             self.config.ad_url = text
             self.config.save()
             self.admin_states[sender_id] = AdminState.NONE
-            await self.send_message(sender_id, "Ссылка рекламы изменена")
+            await self.send_message(sender_id, rep.AD_LINK_CHANGED)
             await self.send_master_ad_submenu(sender_id)
             return
 
@@ -1649,7 +1696,7 @@ class MaxBot:
             self.config.comments_chat_text = text
             self.config.save()
             self.admin_states[sender_id] = AdminState.NONE
-            await self.send_message(sender_id, f"Текст кнопки чата изменен: {text}")
+            await self.send_message(sender_id, rep.CHAT_BTN_TEXT_CHANGED.format(text=text))
             await self.send_master_btns_submenu(sender_id)
             return
 
@@ -1657,31 +1704,31 @@ class MaxBot:
             try:
                 mid = int(text)
             except ValueError:
-                await self.send_message(sender_id, "Нужен числовой user_id.")
+                await self.send_message(sender_id, rep.PROMOTED_NEED_NUMERIC)
                 return
             if mid in self.config.root_admin_ids:
-                await self.send_message(sender_id, "Уже в .env.")
+                await self.send_message(sender_id, rep.PROMOTED_ALREADY_ENV)
                 await self.send_master_masters_submenu(sender_id)
                 return
             if mid in self.config.promoted_master_ids:
-                await self.send_message(sender_id, "Уже в списке.")
+                await self.send_message(sender_id, rep.PROMOTED_ALREADY_LIST)
                 await self.send_master_masters_submenu(sender_id)
                 return
             self.config.promoted_master_ids = sorted(set(self.config.promoted_master_ids + [mid]))
             self.config.save()
             self.admin_states[sender_id] = AdminState.NONE
-            await self.send_message(sender_id, f"Мастер добавлен в конфиг: {mid}")
+            await self.send_message(sender_id, rep.PROMOTED_ADDED.format(mid=mid))
             await self.send_master_masters_submenu(sender_id)
             return
 
         if state == AdminState.AWAITING_BIND_CHANNEL_INVITE:
             cid, info, err = await self.resolve_chat_from_input(text)
             if err or cid is None:
-                await self.send_message(sender_id, err or "Не удалось определить канал.")
+                await self.send_message(sender_id, err or rep.ERR_RESOLVE_CHANNEL_DEFAULT)
                 return
             mem, merr = await self.get_bot_membership(cid)
             if merr or not mem:
-                await self.send_message(sender_id, merr or "Ошибка проверки прав бота.")
+                await self.send_message(sender_id, merr or rep.ERR_BOT_MEMBERSHIP_DEFAULT)
                 return
             ok_ch, reason_ch = check_channel_admin_permissions(mem)
             if not ok_ch:
@@ -1691,16 +1738,12 @@ class MaxBot:
                     reason_ch,
                     membership_summary(mem),
                 )
-                await self.send_message(
-                    sender_id,
-                    "Бот должен быть администратором канала с правом редактировать сообщения "
-                    "(или владельцем). Если доступы уже выданы — см. лог members/me на сервере.",
-                )
+                await self.send_message(sender_id, rep.CHANNEL_NEED_BOT_ADMIN_EDIT)
                 return
             logger.info("Канал chat_id=%s: проверка прав OK (%s)", cid, reason_ch)
             for b in self.config.channel_bindings:
                 if int(b["channel_id"]) == cid:
-                    await self.send_message(sender_id, "Этот канал уже подключён. Удалите запись в меню «Каналы» перед повторной привязкой.")
+                    await self.send_message(sender_id, rep.CHANNEL_ALREADY_BOUND)
                     self.admin_states[sender_id] = AdminState.NONE
                     self.channel_bind_draft.pop(sender_id, None)
                     await self.send_channels_submenu(sender_id)
@@ -1711,30 +1754,26 @@ class MaxBot:
                 "channel_title": title,
             }
             self.admin_states[sender_id] = AdminState.AWAITING_BIND_COMMENTS_INVITE
-            await self.send_message(
-                sender_id,
-                "Канал принят. Теперь отправьте ссылку-приглашение в чат комментариев "
-                "(или числовой chat_id чата). Бот должен быть администратором с правом писать в чат.",
-            )
+            await self.send_message(sender_id, rep.CHANNEL_STEP_COMMENTS)
             return
 
         if state == AdminState.AWAITING_BIND_COMMENTS_INVITE:
             draft = self.channel_bind_draft.get(sender_id)
             if not draft or "channel_id" not in draft:
                 self.admin_states[sender_id] = AdminState.NONE
-                await self.send_message(sender_id, "Сессия добавления канала сброшена. Начните снова из меню «Каналы».")
+                await self.send_message(sender_id, rep.BIND_SESSION_RESET)
                 await self.send_channels_submenu(sender_id)
                 return
             ccid, cinfo, err = await self.resolve_chat_from_input(text)
             if err or ccid is None:
-                await self.send_message(sender_id, err or "Не удалось определить чат.")
+                await self.send_message(sender_id, err or rep.ERR_RESOLVE_CHAT_DEFAULT)
                 return
             if ccid == int(draft["channel_id"]):
-                await self.send_message(sender_id, "Чат комментариев не должен совпадать с каналом. Укажите другой чат.")
+                await self.send_message(sender_id, rep.COMMENTS_SAME_AS_CHANNEL)
                 return
             mem, merr = await self.get_bot_membership(ccid)
             if merr or not mem:
-                await self.send_message(sender_id, merr or "Ошибка проверки прав бота.")
+                await self.send_message(sender_id, merr or rep.ERR_BOT_MEMBERSHIP_DEFAULT)
                 return
             ok_cc, reason_cc = check_comments_chat_admin_permissions(mem)
             if not ok_cc:
@@ -1744,11 +1783,7 @@ class MaxBot:
                     reason_cc,
                     membership_summary(mem),
                 )
-                await self.send_message(
-                    sender_id,
-                    "Бот должен быть администратором чата с правом писать сообщения "
-                    "(или владельцем). Если доступы уже выданы — см. лог members/me на сервере.",
-                )
+                await self.send_message(sender_id, rep.COMMENTS_NEED_BOT_ADMIN)
                 return
             logger.info("Чат комментариев chat_id=%s: проверка прав OK (%s)", ccid, reason_cc)
             t = text.strip()
@@ -1757,11 +1792,7 @@ class MaxBot:
             else:
                 invite_url = normalize_max_url(t if t.startswith("http") else "https://" + t.lstrip("/"))
             if not invite_url:
-                await self.send_message(
-                    sender_id,
-                    "Не удалось сохранить ссылку-приглашение: пришлите полную https-ссылку из приглашения в чат "
-                    "(или chat_id, если у чата есть публичная ссылка в данных API).",
-                )
+                await self.send_message(sender_id, rep.INVITE_SAVE_FAILED)
                 return
             ch_title = (cinfo or {}).get("title") if cinfo else None
             ar = self.config.account_root_for(sender_id)
@@ -1780,7 +1811,7 @@ class MaxBot:
             self.config.save()
             self.channel_bind_draft.pop(sender_id, None)
             self.admin_states[sender_id] = AdminState.NONE
-            await self.send_message(sender_id, "Канал и чат комментариев подключены.")
+            await self.send_message(sender_id, rep.CHANNEL_PAIR_CONNECTED)
             await self.send_channels_submenu(sender_id)
             return
 
@@ -1788,7 +1819,7 @@ class MaxBot:
             self.config.comments_message_button_text = text
             self.config.save()
             self.admin_states[sender_id] = AdminState.NONE
-            await self.send_message(sender_id, f"Текст кнопки к сообщению изменен: {text}")
+            await self.send_message(sender_id, rep.MSG_BTN_TEXT_CHANGED.format(text=text))
             await self.send_master_btns_submenu(sender_id)
             return
 
@@ -1796,27 +1827,21 @@ class MaxBot:
             try:
                 new_admin_id = int(text)
             except ValueError:
-                await self.send_message(sender_id, "Нужно отправить только числовой user_id нового админа.")
+                await self.send_message(sender_id, rep.DELEGATE_NEED_NUMERIC)
                 return
             if self.is_master(new_admin_id):
-                await self.send_message(sender_id, "Нельзя добавить мастер-админа как делегата.")
+                await self.send_message(sender_id, rep.DELEGATE_NO_MASTER)
                 return
             if new_admin_id in self.config.delegate_parent:
-                await self.send_message(
-                    sender_id,
-                    "Этот пользователь уже в дереве делегатов (только один «спонсор»).",
-                )
+                await self.send_message(sender_id, rep.DELEGATE_ALREADY_IN_TREE)
                 return
             if any(int(b["account_root_id"]) == new_admin_id for b in self.config.channel_bindings):
-                await self.send_message(
-                    sender_id,
-                    "У этого пользователя уже есть свои каналы (отдельный аккаунт).",
-                )
+                await self.send_message(sender_id, rep.DELEGATE_HAS_OWN_ACCOUNT)
                 return
             self.config.delegate_parent[new_admin_id] = sender_id
             self.config.save()
             self.admin_states[sender_id] = AdminState.NONE
-            await self.send_message(sender_id, f"Делегат добавлен: {new_admin_id}")
+            await self.send_message(sender_id, rep.DELEGATE_ADDED.format(uid=new_admin_id))
             await self.send_delegates_submenu(sender_id)
             return
 
@@ -1830,13 +1855,13 @@ class MaxBot:
             if not bmute or not self.can_access_channel(sender_id, bmute):
                 self.mute_range_channel_id.pop(sender_id, None)
                 self.admin_states[sender_id] = AdminState.NONE
-                await self.send_message(sender_id, "Нет доступа к этому каналу.")
+                await self.send_message(sender_id, rep.NO_ACCESS_CHANNEL)
                 await self.send_channels_submenu(sender_id)
                 return
             try:
                 qh = normalize_quiet_hours(text)
             except ValueError:
-                await self.send_message(sender_id, "Формат: HH:MM-HH:MM, например 12:00-14:00 или 21:33-07:00")
+                await self.send_message(sender_id, rep.MUTE_RANGE_FORMAT)
                 return
             updated = False
             for b in self.config.channel_bindings:
@@ -1847,13 +1872,13 @@ class MaxBot:
             if not updated:
                 self.mute_range_channel_id.pop(sender_id, None)
                 self.admin_states[sender_id] = AdminState.NONE
-                await self.send_message(sender_id, "Привязка канала не найдена.")
+                await self.send_message(sender_id, rep.BINDING_NOT_FOUND)
                 await self.send_channels_submenu(sender_id)
                 return
             self.config.save()
             self.admin_states[sender_id] = AdminState.NONE
             self.mute_range_channel_id.pop(sender_id, None)
-            await self.send_message(sender_id, f"Диапазон Mute обновлен: {qh} (МСК)")
+            await self.send_message(sender_id, rep.MUTE_RANGE_UPDATED.format(qh=qh))
             await self.send_chat_mute_submenu(sender_id, mcid)
             return
 
@@ -1868,7 +1893,7 @@ class MaxBot:
             if not bpe or not self.can_access_channel(sender_id, bpe):
                 self.admin_states[sender_id] = AdminState.NONE
                 self.post_edit_ref.pop(sender_id, None)
-                await self.send_message(sender_id, "Нет доступа к этому каналу.")
+                await self.send_message(sender_id, rep.NO_ACCESS_CHANNEL)
                 await self.send_channels_submenu(sender_id)
                 return
             mid = str(ctx["message_id"])
@@ -1877,16 +1902,13 @@ class MaxBot:
             raw_attachments = msg.get("body", {}).get("attachments") or []
             new_media = clean_media_attachments_from_body(raw_attachments, strip_ref_fields=False)
             if not new_media:
-                await self.send_message(
-                    sender_id,
-                    "В сообщении нет вложения с картинкой. Отправьте фото или изображение одним сообщением.",
-                )
+                await self.send_message(sender_id, rep.POST_EDIT_NO_IMAGE)
                 return
             tr = self.config.find_tracked_post(cid, mid)
             if not tr:
                 self.admin_states[sender_id] = AdminState.NONE
                 self.post_edit_ref.pop(sender_id, None)
-                await self.send_message(sender_id, "Пост не найден или срок хранения истёк.")
+                await self.send_message(sender_id, rep.POST_NOT_FOUND)
                 await self.send_posts_list(sender_id, cid, page)
                 return
             post_text = str(tr.get("text") or "")
@@ -1909,12 +1931,12 @@ class MaxBot:
                 self.admin_states[sender_id] = AdminState.NONE
                 self.post_edit_ref.pop(sender_id, None)
                 if chat_mid:
-                    await self.send_message(sender_id, "Картинка обновлена в канале и в копии в чате комментариев.")
+                    await self.send_message(sender_id, rep.IMAGE_UPDATED_BOTH)
                 else:
-                    await self.send_message(sender_id, "Картинка в канале обновлена.")
+                    await self.send_message(sender_id, rep.IMAGE_UPDATED_CHANNEL)
                 await self.send_post_detail(sender_id, cid, mid, page)
             else:
-                await self.send_message(sender_id, "Не удалось обновить вложения (проверьте права бота и формат файла).")
+                await self.send_message(sender_id, rep.IMAGE_UPDATE_FAILED)
             return
 
         if state == AdminState.AWAITING_POST_EDIT_TEXT:
@@ -1928,7 +1950,7 @@ class MaxBot:
             if not bpt or not self.can_access_channel(sender_id, bpt):
                 self.admin_states[sender_id] = AdminState.NONE
                 self.post_edit_ref.pop(sender_id, None)
-                await self.send_message(sender_id, "Нет доступа к этому каналу.")
+                await self.send_message(sender_id, rep.NO_ACCESS_CHANNEL)
                 await self.send_channels_submenu(sender_id)
                 return
             mid = str(ctx["message_id"])
@@ -2031,65 +2053,94 @@ class MaxBot:
                 self.admin_states[sender_id] = AdminState.NONE
                 self.post_edit_ref.pop(sender_id, None)
                 if chat_mid:
-                    await self.send_message(sender_id, "Текст обновлён в канале и в копии в чате комментариев.")
+                    await self.send_message(sender_id, rep.TEXT_UPDATED_BOTH)
                 else:
-                    await self.send_message(sender_id, "Текст поста в канале обновлён.")
+                    await self.send_message(sender_id, rep.TEXT_UPDATED_CHANNEL)
                 await self.send_post_detail(sender_id, cid, mid, page)
             else:
-                await self.send_message(sender_id, "Не удалось изменить пост (проверьте права бота и message_id).")
+                await self.send_message(sender_id, rep.POST_EDIT_FAILED)
             return
 
         self._reset_fsm(sender_id)
         await self.send_user_menu(sender_id)
 
-    async def send_user_menu(self, user_id: int) -> None:
+    async def send_user_menu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
         buttons = [
-            [{"type": "callback", "text": "Каналы", "payload": "usr_channels"}],
-            [{"type": "callback", "text": "Делегаты", "payload": "usr_delegates"}],
+            [{"type": "callback", "text": rep.BTN_CHANNELS, "payload": "usr_channels"}],
+            [{"type": "callback", "text": rep.BTN_DELEGATES, "payload": "usr_delegates"}],
         ]
-        text = (
-            "Каналы и делегаты вашего аккаунта.\n"
-            "Глобальная реклама и мастер-настройки — команда /admin (только мастера)."
+        text = _menu_prepend(rep.USER_MENU_INTRO, prepend)
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
         )
-        await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
 
-    async def send_master_menu(self, user_id: int) -> None:
+    async def send_master_menu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
         buttons: List[List[Dict]] = [
-            [{"type": "callback", "text": "Рекламная ссылка", "payload": "mst_ad"}],
-            [{"type": "callback", "text": "Кнопки в посте", "payload": "mst_btns"}],
-            [{"type": "callback", "text": "Статистика", "payload": "mst_stats"}],
+            [{"type": "callback", "text": rep.BTN_AD_LINK, "payload": "mst_ad"}],
+            [{"type": "callback", "text": rep.BTN_POST_BUTTONS, "payload": "mst_btns"}],
+            [{"type": "callback", "text": rep.BTN_STATS, "payload": "mst_stats"}],
         ]
         if self.is_master_env(user_id):
-            buttons.append([{"type": "callback", "text": "Мастер-админы (конфиг)", "payload": "mst_masters"}])
-        await self.send_message(
+            buttons.append([{"type": "callback", "text": rep.BTN_MASTER_ADMINS, "payload": "mst_masters"}])
+        text = _menu_prepend(rep.MASTER_MENU_INTRO, prepend)
+        await self.show_menu_or_edit(
             user_id,
-            "Мастер-панель: глобальная реклама, кнопки под постами, счётчик кликов по рекламе.",
+            text,
             [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
         )
 
-    async def send_posts_list(self, user_id: int, channel_id: int, page: int) -> None:
+    async def send_posts_list(
+        self,
+        user_id: int,
+        channel_id: int,
+        page: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
         b = self.config.binding_for_channel(channel_id)
         if not b or not self.can_access_channel(user_id, b):
-            await self.send_message(user_id, "Канал не найден или нет доступа.")
-            await self.send_channels_submenu(user_id)
+            await self.send_channels_submenu(
+                user_id,
+                edit_message_id=edit_message_id,
+                prepend=rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+            )
             return
         posts = self.config.sorted_tracked_posts_for_channel(channel_id)
         total = len(posts)
-        title = str(b.get("channel_title") or f"Канал {channel_id}")[:80]
+        title = str(b.get("channel_title") or rep.channel_title_fallback(channel_id))[:80]
         if total == 0:
-            await self.send_message(
+            empty_text = _menu_prepend(rep.POSTS_EMPTY.format(title=title), prepend)
+            await self.show_menu_or_edit(
                 user_id,
-                f"Постов с кнопками для «{title}» пока нет (бот ещё не обрабатывал посты или записи старше 3 суток удалены).",
+                empty_text,
                 [
                     {
                         "type": "inline_keyboard",
                         "payload": {
                             "buttons": [
-                                [{"type": "callback", "text": "Назад", "payload": f"usr_ch_detail:{channel_id}"}]
+                                [{"type": "callback", "text": rep.BTN_BACK, "payload": f"usr_ch_detail:{channel_id}"}]
                             ]
                         },
                     }
                 ],
+                edit_message_id=edit_message_id,
             )
             return
         page_size = POSTS_PAGE_SIZE
@@ -2097,11 +2148,7 @@ class MaxBot:
         page = max(0, min(page, max_page))
         start = page * page_size
         chunk = posts[start : start + page_size]
-        lines = [
-            f"Посты канала: {title}",
-            f"Новые сверху. Страница {page + 1} из {max_page + 1}. Всего: {total}. Хранение до 3 суток.",
-        ]
-        text = "\n".join(lines)
+        text = _menu_prepend(rep.posts_list_caption(title, page, max_page, total), prepend)
         buttons: List[List[Dict]] = []
         for p in chunk:
             cid = int(p["channel_id"])
@@ -2126,176 +2173,269 @@ class MaxBot:
         nav: List[Dict] = []
         if page > 0:
             nav.append(
-                {"type": "callback", "text": "←", "payload": f"usr_ch_posts:{channel_id}:{page - 1}"}
+                {"type": "callback", "text": rep.NAV_PREV, "payload": f"usr_ch_posts:{channel_id}:{page - 1}"}
             )
         if page < max_page:
             nav.append(
-                {"type": "callback", "text": "→", "payload": f"usr_ch_posts:{channel_id}:{page + 1}"}
+                {"type": "callback", "text": rep.NAV_NEXT, "payload": f"usr_ch_posts:{channel_id}:{page + 1}"}
             )
         if nav:
             buttons.append(nav)
-        buttons.append([{"type": "callback", "text": "Назад", "payload": f"usr_ch_detail:{channel_id}"}])
-        await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
+        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": f"usr_ch_detail:{channel_id}"}])
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
 
-    async def send_post_detail(self, user_id: int, channel_id: int, message_id: str, return_page: int) -> None:
+    async def send_post_detail(
+        self,
+        user_id: int,
+        channel_id: int,
+        message_id: str,
+        return_page: int,
+        *,
+        edit_message_id: Optional[str] = None,
+    ) -> None:
         b = self.config.binding_for_channel(channel_id)
         if not b or not self.can_access_channel(user_id, b):
-            await self.send_message(user_id, "Нет доступа к этому каналу.")
-            await self.send_channels_submenu(user_id)
+            await self.send_channels_submenu(
+                user_id,
+                edit_message_id=edit_message_id,
+                prepend=rep.NO_ACCESS_CHANNEL,
+            )
             return
         self.config.prune_tracked_posts()
         p = self.config.find_tracked_post(channel_id, message_id)
         if not p:
-            await self.send_message(user_id, "Пост не найден или срок хранения истёк.")
-            await self.send_posts_list(user_id, channel_id, return_page)
+            await self.send_posts_list(
+                user_id,
+                channel_id,
+                return_page,
+                edit_message_id=edit_message_id,
+                prepend=rep.POST_NOT_FOUND,
+            )
             return
-        body = (p.get("text") or "").strip() or "(пустой текст)"
+        body = (p.get("text") or "").strip() or rep.EMPTY_POST_PLACEHOLDER
         ref = encode_post_ref(channel_id, message_id)
-        msg_text = f"Текст поста:\n\n{body}"
+        msg_text = f"{rep.POST_DETAIL_PREFIX}{body}"
         buttons = [
-            [{"type": "callback", "text": "Поменять текст", "payload": f"usr_post_edit:{ref}:{return_page}:{channel_id}"}],
-            [{"type": "callback", "text": "Поменять картинку", "payload": f"usr_post_edit_img:{ref}:{return_page}:{channel_id}"}],
-            [{"type": "callback", "text": "Назад", "payload": f"usr_ch_posts:{channel_id}:{return_page}"}],
+            [{"type": "callback", "text": rep.BTN_CHANGE_POST_TEXT, "payload": f"usr_post_edit:{ref}:{return_page}:{channel_id}"}],
+            [{"type": "callback", "text": rep.BTN_CHANGE_POST_IMAGE, "payload": f"usr_post_edit_img:{ref}:{return_page}:{channel_id}"}],
+            [{"type": "callback", "text": rep.BTN_BACK, "payload": f"usr_ch_posts:{channel_id}:{return_page}"}],
         ]
         kb = {"type": "inline_keyboard", "payload": {"buttons": buttons}}
         media = list(p.get("media_attachments") or [])
         preview_fmt = normalize_text_format(p.get("text_format"))
         preview_mu = tracked_markup_for_api(p)
         if media:
-            await self.send_message(
-                user_id, msg_text, media + [kb], text_format=preview_fmt, markup=preview_mu
+            await self.show_menu_or_edit(
+                user_id,
+                msg_text,
+                media + [kb],
+                text_format=preview_fmt,
+                markup=preview_mu,
+                edit_message_id=edit_message_id,
             )
         else:
-            await self.send_message(user_id, msg_text, [kb], text_format=preview_fmt, markup=preview_mu)
+            await self.show_menu_or_edit(
+                user_id,
+                msg_text,
+                [kb],
+                text_format=preview_fmt,
+                markup=preview_mu,
+                edit_message_id=edit_message_id,
+            )
 
-    async def send_master_ad_submenu(self, user_id: int) -> None:
+    async def send_master_ad_submenu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
         buttons = [
-            [{"type": "callback", "text": "Изменить текст", "payload": "mst_set_adtxt"}],
-            [{"type": "callback", "text": "Изменить ссылку", "payload": "mst_set_adurl"}],
-            [{"type": "callback", "text": "Назад", "payload": "mst_menu"}],
+            [{"type": "callback", "text": rep.BTN_CHANGE_TEXT, "payload": "mst_set_adtxt"}],
+            [{"type": "callback", "text": rep.BTN_CHANGE_LINK, "payload": "mst_set_adurl"}],
+            [{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}],
         ]
-        text = f"Реклама\nТекст: {self.config.ad_text}\nСсылка: {self.config.ad_url}"
-        await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
-
-    async def send_master_btns_submenu(self, user_id: int) -> None:
-        buttons = [
-            [{"type": "callback", "text": "Текст: вход в чат", "payload": "mst_set_chtxt"}],
-            [{"type": "callback", "text": "Текст: к сообщению", "payload": "mst_set_msgbtn"}],
-            [{"type": "callback", "text": "Назад", "payload": "mst_menu"}],
-        ]
-        text = (
-            "Кнопки под постом в канале (одинаковые для всех подключённых каналов).\n"
-            "Ссылку-приглашение в чат комментариев для каждого канала задаёте в пользовательском меню «Каналы».\n\n"
-            f"Текст кнопки входа в чат: {self.config.comments_chat_text}\n"
-            f"Текст кнопки к сообщению: {self.config.comments_message_button_text}"
+        text = _menu_prepend(
+            rep.MASTER_AD_SUBMENU.format(ad_text=self.config.ad_text, ad_url=self.config.ad_url),
+            prepend,
         )
-        await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
 
-    async def send_master_masters_submenu(self, user_id: int) -> None:
-        lines = ["Мастер-админы (хранятся в config.json, не в .env)."]
+    async def send_master_btns_submenu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
+        buttons = [
+            [{"type": "callback", "text": rep.BTN_CHAT_ENTRY_TEXT, "payload": "mst_set_chtxt"}],
+            [{"type": "callback", "text": rep.BTN_MSG_LINK_TEXT, "payload": "mst_set_msgbtn"}],
+            [{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}],
+        ]
+        text = _menu_prepend(
+            rep.MASTER_BTNS_SUBMENU.format(
+                chat_btn=self.config.comments_chat_text,
+                msg_btn=self.config.comments_message_button_text,
+            ),
+            prepend,
+        )
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
+
+    async def send_master_masters_submenu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
+        lines = [rep.MASTER_LIST_HEADER]
         pm = self.config.promoted_master_ids
-        lines.append("Список: " + (", ".join(str(x) for x in pm) or "—"))
+        lines.append(rep.master_list_line(", ".join(str(x) for x in pm)))
         buttons: List[List[Dict]] = [
-            [{"type": "callback", "text": "Добавить мастера", "payload": "mst_add_master"}],
+            [{"type": "callback", "text": rep.BTN_ADD_MASTER, "payload": "mst_add_master"}],
         ]
         for mid in pm:
             buttons.append(
-                [{"type": "callback", "text": f"Удалить {mid}", "payload": f"mst_rm_master:{mid}"}]
+                [{"type": "callback", "text": f"{rep.BTN_DELETE} {mid}", "payload": f"mst_rm_master:{mid}"}]
             )
-        buttons.append([{"type": "callback", "text": "Назад", "payload": "mst_menu"}])
-        await self.send_message(user_id, "\n".join(lines), [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
+        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}])
+        text = _menu_prepend("\n".join(lines), prepend)
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
 
-    async def send_channels_submenu(self, user_id: int) -> None:
+    async def send_channels_submenu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
         bindings = self.bindings_visible(user_id)
         lines = [
-            "Подключённые каналы (канал → чат комментариев).",
-            f"{DELEGATED_CHANNEL_EMOJI.strip()} — канал добавлен не вами (наследован от вышестоящего админа).",
+            rep.CHANNELS_HEADER,
+            rep.CHANNELS_DELEGATED_HINT.format(emoji=rep.DELEGATED_CHANNEL_EMOJI.strip()),
         ]
         if not bindings:
-            lines.append("Пока ничего не подключено — нажмите «Добавить канал».")
+            lines.append(rep.CHANNELS_EMPTY)
         else:
             for i, b in enumerate(bindings, start=1):
                 cid = b["channel_id"]
                 ccid = b["comments_chat_id"]
                 ct = b.get("channel_title") or f"id {cid}"
                 cct = b.get("comments_chat_title") or f"id {ccid}"
-                lines.append(f"{i}. {ct} ({cid}) → {cct} ({ccid})")
+                lines.append(rep.channel_list_line(i, ct, cid, cct, ccid))
         text = "\n".join(lines)
-        buttons: List[List[Dict]] = [[{"type": "callback", "text": "Добавить канал", "payload": "usr_add_ch"}]]
+        buttons: List[List[Dict]] = [[{"type": "callback", "text": rep.BTN_ADD_CHANNEL, "payload": "usr_add_ch"}]]
         for b in bindings:
             cid = int(b["channel_id"])
             label = self.channel_label_for_user(user_id, b)[:60]
             buttons.append(
                 [{"type": "callback", "text": label, "payload": f"usr_ch_detail:{cid}"}]
             )
-        buttons.append([{"type": "callback", "text": "Назад", "payload": "usr_menu"}])
+        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": "usr_menu"}])
         await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
 
     async def send_channel_detail_submenu(self, user_id: int, channel_id: int) -> None:
         b = self.config.binding_for_channel(channel_id)
         if not b or not self.can_access_channel(user_id, b):
-            await self.send_message(user_id, "Канал не найден или нет доступа.")
+            await self.send_message(user_id, rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS)
             await self.send_channels_submenu(user_id)
             return
         cid = int(b["channel_id"])
         ccid = int(b["comments_chat_id"])
         ct = b.get("channel_title") or f"id {cid}"
         cct = b.get("comments_chat_title") or f"id {ccid}"
-        text = (
-            f"Канал: {ct}\n"
-            f"channel_id: {cid}\n\n"
-            f"Чат комментариев: {cct}\n"
-            f"comments_chat_id: {ccid}"
-        )
+        text = rep.channel_detail_text(ct, cid, cct, ccid)
         buttons = [
-            [{"type": "callback", "text": "Mute", "payload": f"usr_ch_mute:{cid}"}],
-            [{"type": "callback", "text": "Посты", "payload": f"usr_ch_posts:{cid}:0"}],
-            [{"type": "callback", "text": "Удалить", "payload": f"usr_rm_ch:{cid}"}],
-            [{"type": "callback", "text": "Назад", "payload": "usr_channels"}],
+            [{"type": "callback", "text": rep.BTN_MUTE, "payload": f"usr_ch_mute:{cid}"}],
+            [{"type": "callback", "text": rep.BTN_POSTS, "payload": f"usr_ch_posts:{cid}:0"}],
+            [{"type": "callback", "text": rep.BTN_DELETE, "payload": f"usr_rm_ch:{cid}"}],
+            [{"type": "callback", "text": rep.BTN_BACK, "payload": "usr_channels"}],
         ]
-        await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
 
-    async def send_delegates_submenu(self, user_id: int) -> None:
+    async def send_delegates_submenu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
         dels = self.direct_delegate_ids(user_id)
-        admins_text = ", ".join(str(x) for x in dels) or "—"
+        admins_text = ", ".join(str(x) for x in dels) or rep.LIST_EMPTY_DASH
         buttons = [
-            [{"type": "callback", "text": "Добавить делегата", "payload": "usr_add_del"}],
+            [{"type": "callback", "text": rep.BTN_ADD_DELEGATE, "payload": "usr_add_del"}],
         ]
         for did in dels:
             buttons.append(
-                [{"type": "callback", "text": f"Удалить {did}", "payload": f"usr_rm_del:{did}"}]
+                [{"type": "callback", "text": f"{rep.BTN_DELETE} {did}", "payload": f"usr_rm_del:{did}"}]
             )
-        buttons.append([{"type": "callback", "text": "Назад", "payload": "usr_menu"}])
-        text = (
-            "Делегаты (видят только каналы, которые добавили вы, и наследованные от вас по правилам бота).\n"
-            f"Текущие: {admins_text}"
+        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": "usr_menu"}])
+        text = _menu_prepend(rep.DELEGATES_MENU.format(list_text=admins_text), prepend)
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
         )
-        await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
 
-    async def send_chat_mute_submenu(self, user_id: int, channel_id: int) -> None:
+    async def send_chat_mute_submenu(
+        self,
+        user_id: int,
+        channel_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+    ) -> None:
         b = self.config.binding_for_channel(channel_id)
         if not b or not self.can_access_channel(user_id, b):
-            await self.send_message(user_id, "Канал не найден или нет доступа.")
-            await self.send_channels_submenu(user_id)
+            await self.send_channels_submenu(
+                user_id,
+                edit_message_id=edit_message_id,
+                prepend=rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+            )
             return
         mute_en = bool(b.get("chat_mute_enabled"))
         qh = str(b.get("quiet_hours") or "").strip()
-        title = str(b.get("channel_title") or f"Канал {channel_id}")[:50]
-        toggle_text = "Выключить Mute" if mute_en else "Включить Mute"
+        title = str(b.get("channel_title") or rep.channel_title_fallback(channel_id))[:50]
+        toggle_text = rep.BTN_MUTE_ON if mute_en else rep.BTN_MUTE_OFF
         buttons = [
             [{"type": "callback", "text": toggle_text, "payload": f"usr_toggle_mute:{channel_id}"}],
-            [{"type": "callback", "text": "Изменить диапазон", "payload": f"usr_mute_range:{channel_id}"}],
-            [{"type": "callback", "text": "Назад", "payload": f"usr_ch_detail:{channel_id}"}],
+            [{"type": "callback", "text": rep.BTN_EDIT_RANGE, "payload": f"usr_mute_range:{channel_id}"}],
+            [{"type": "callback", "text": rep.BTN_BACK, "payload": f"usr_ch_detail:{channel_id}"}],
         ]
-        current = qh or "не настроены"
-        text = (
-            f"Mute (чат комментариев к этому каналу)\n"
-            f"{title}\n"
-            f"Статус: {'включен' if mute_en else 'выключен'}\n"
-            f"Диапазон: {current}\n"
-            "Часовой пояс: Europe/Moscow (МСК)"
+        current = qh or rep.MUTE_RANGE_NOT_SET
+        text = rep.mute_submenu_text(title, mute_en, current)
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
         )
-        await self.send_message(user_id, text, [{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
 
     async def on_callback(self, update: Dict[str, Any]) -> None:
         callback_data = update.get("callback", {})
@@ -2304,6 +2444,7 @@ class MaxBot:
         sender_id = int(user_data.get("user_id")) if user_data.get("user_id") else None
         if sender_id is None or not payload:
             return
+        callback_mid = message_mid_from_callback_update(update)
 
         if payload == "mst_ad_click":
             self.config.ad_click_total += 1
@@ -2317,60 +2458,77 @@ class MaxBot:
             if not self.is_master(sender_id):
                 return
             if payload == "mst_menu":
-                await self.send_master_menu(sender_id)
+                await self.send_master_menu(sender_id, edit_message_id=callback_mid)
             elif payload == "mst_ad":
-                await self.send_master_ad_submenu(sender_id)
+                await self.send_master_ad_submenu(sender_id, edit_message_id=callback_mid)
             elif payload == "mst_btns":
-                await self.send_master_btns_submenu(sender_id)
+                await self.send_master_btns_submenu(sender_id, edit_message_id=callback_mid)
             elif payload == "mst_stats":
-                await self.send_message(
+                await self.show_menu_or_edit(
                     sender_id,
-                    f"Переходов по рекламной кнопке (callback): {self.config.ad_click_total}",
+                    rep.stats_line_short(self.config.ad_click_total),
+                    [
+                        {
+                            "type": "inline_keyboard",
+                            "payload": {
+                                "buttons": [[{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}]]
+                            },
+                        }
+                    ],
+                    edit_message_id=callback_mid,
                 )
             elif payload == "mst_masters":
                 if not self.is_master_env(sender_id):
                     return
-                await self.send_master_masters_submenu(sender_id)
+                await self.send_master_masters_submenu(sender_id, edit_message_id=callback_mid)
             elif payload == "mst_add_master":
                 if not self.is_master_env(sender_id):
                     return
                 self.admin_states[sender_id] = AdminState.AWAITING_NEW_PROMOTED_MASTER
-                await self.send_message(sender_id, "Введите user_id нового мастера (в конфиге):")
+                await self.replace_with_prompt_or_send(
+                    sender_id,
+                    rep.PROMPT_NEW_MASTER_ID,
+                    edit_message_id=callback_mid,
+                )
             elif isinstance(payload, str) and payload.startswith("mst_rm_master:"):
                 if not self.is_master_env(sender_id):
                     return
                 try:
-                    mid = int(payload.split(":", 1)[1])
+                    rm_mid = int(payload.split(":", 1)[1])
                 except ValueError:
                     return
-                self.config.promoted_master_ids = [x for x in self.config.promoted_master_ids if x != mid]
+                self.config.promoted_master_ids = [x for x in self.config.promoted_master_ids if x != rm_mid]
                 self.config.save()
-                await self.send_message(sender_id, f"Удалён из мастеров конфига: {mid}")
-                await self.send_master_masters_submenu(sender_id)
+                await self.send_master_masters_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.PROMOTED_REMOVED.format(mid=rm_mid),
+                )
             elif payload == "mst_set_adtxt":
                 self.admin_states[sender_id] = AdminState.AWAITING_AD_TEXT
-                await self.send_message(sender_id, "Введите новый текст рекламной кнопки:")
+                await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_AD_TEXT, edit_message_id=callback_mid)
             elif payload == "mst_set_adurl":
                 self.admin_states[sender_id] = AdminState.AWAITING_AD_LINK
-                await self.send_message(sender_id, "Введите новую ссылку рекламы:")
+                await self.replace_with_prompt_or_send(
+                    sender_id,
+                    rep.PROMPT_AD_URL,
+                    edit_message_id=callback_mid,
+                )
             elif payload == "mst_set_chtxt":
                 self.admin_states[sender_id] = AdminState.AWAITING_CHAT_TEXT
-                await self.send_message(sender_id, "Введите новый текст кнопки входа в чат комментариев:")
+                await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_CHAT_BTN, edit_message_id=callback_mid)
             elif payload == "mst_set_msgbtn":
                 self.admin_states[sender_id] = AdminState.AWAITING_COMMENTS_MESSAGE_BUTTON_TEXT
-                await self.send_message(
-                    sender_id,
-                    "Введите новый текст кнопки, которая ведёт к конкретному сообщению в чате комментариев:",
-                )
+                await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_MSG_BTN, edit_message_id=callback_mid)
             return
 
         if not self.can_use_user_menu(sender_id):
             return
 
         if payload == "usr_menu":
-            await self.send_user_menu(sender_id)
+            await self.send_user_menu(sender_id, edit_message_id=callback_mid)
         elif payload == "usr_channels":
-            await self.send_channels_submenu(sender_id)
+            await self.send_channels_submenu(sender_id, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_ch_posts:"):
             rest = payload[len("usr_ch_posts:") :]
             parts = rest.split(":", 1)
@@ -2381,7 +2539,7 @@ class MaxBot:
                 pg = int(parts[1])
             except ValueError:
                 return
-            await self.send_posts_list(sender_id, ch_id, pg)
+            await self.send_posts_list(sender_id, ch_id, pg, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_post_detail:"):
             rest = payload[len("usr_post_detail:") :]
             parts = rest.rsplit(":", 2)
@@ -2395,14 +2553,23 @@ class MaxBot:
                 return
             dec = decode_post_ref(ref)
             if not dec:
-                await self.send_message(sender_id, "Некорректная ссылка на пост.")
+                await self.send_user_menu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.ERR_BAD_POST_REF,
+                )
                 return
             cid, mid = dec
             if int(cid) != int(list_ch):
-                await self.send_message(sender_id, "Несовпадение канала.")
-                await self.send_posts_list(sender_id, list_ch, page)
+                await self.send_posts_list(
+                    sender_id,
+                    list_ch,
+                    page,
+                    edit_message_id=callback_mid,
+                    prepend=rep.ERR_CHANNEL_MISMATCH,
+                )
                 return
-            await self.send_post_detail(sender_id, cid, mid, page)
+            await self.send_post_detail(sender_id, cid, mid, page, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_post_edit:"):
             rest = payload[len("usr_post_edit:") :]
             parts = rest.rsplit(":", 2)
@@ -2416,21 +2583,39 @@ class MaxBot:
                 return
             dec = decode_post_ref(ref)
             if not dec:
-                await self.send_message(sender_id, "Некорректная ссылка.")
+                await self.send_user_menu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.ERR_BAD_REF,
+                )
                 return
             cid, mid = dec
             if int(cid) != int(list_ch):
-                await self.send_message(sender_id, "Несовпадение канала.")
-                await self.send_posts_list(sender_id, list_ch, page)
+                await self.send_posts_list(
+                    sender_id,
+                    list_ch,
+                    page,
+                    edit_message_id=callback_mid,
+                    prepend=rep.ERR_CHANNEL_MISMATCH,
+                )
                 return
             b0 = self.config.binding_for_channel(cid)
             if not b0 or not self.can_access_channel(sender_id, b0):
-                await self.send_message(sender_id, "Нет доступа к этому каналу.")
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.NO_ACCESS_CHANNEL,
+                )
                 return
             tr = self.config.find_tracked_post(cid, mid)
             if not tr:
-                await self.send_message(sender_id, "Пост не найден или срок хранения истёк.")
-                await self.send_posts_list(sender_id, cid, page)
+                await self.send_posts_list(
+                    sender_id,
+                    cid,
+                    page,
+                    edit_message_id=callback_mid,
+                    prepend=rep.POST_NOT_FOUND,
+                )
                 return
             self.post_edit_ref[sender_id] = {
                 "channel_id": cid,
@@ -2439,7 +2624,7 @@ class MaxBot:
                 "return_page": page,
             }
             self.admin_states[sender_id] = AdminState.AWAITING_POST_EDIT_TEXT
-            await self.send_message(sender_id, "Введите новый текст поста в канале (одним сообщением):")
+            await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_POST_NEW_TEXT, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_post_edit_img:"):
             rest = payload[len("usr_post_edit_img:") :]
             parts = rest.rsplit(":", 2)
@@ -2453,21 +2638,39 @@ class MaxBot:
                 return
             dec = decode_post_ref(ref)
             if not dec:
-                await self.send_message(sender_id, "Некорректная ссылка.")
+                await self.send_user_menu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.ERR_BAD_REF,
+                )
                 return
             cid, mid = dec
             if int(cid) != int(list_ch):
-                await self.send_message(sender_id, "Несовпадение канала.")
-                await self.send_posts_list(sender_id, list_ch, page)
+                await self.send_posts_list(
+                    sender_id,
+                    list_ch,
+                    page,
+                    edit_message_id=callback_mid,
+                    prepend=rep.ERR_CHANNEL_MISMATCH,
+                )
                 return
             b1 = self.config.binding_for_channel(cid)
             if not b1 or not self.can_access_channel(sender_id, b1):
-                await self.send_message(sender_id, "Нет доступа к этому каналу.")
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.NO_ACCESS_CHANNEL,
+                )
                 return
             tr = self.config.find_tracked_post(cid, mid)
             if not tr:
-                await self.send_message(sender_id, "Пост не найден или срок хранения истёк.")
-                await self.send_posts_list(sender_id, cid, page)
+                await self.send_posts_list(
+                    sender_id,
+                    cid,
+                    page,
+                    edit_message_id=callback_mid,
+                    prepend=rep.POST_NOT_FOUND,
+                )
                 return
             self.post_edit_ref[sender_id] = {
                 "channel_id": cid,
@@ -2476,65 +2679,75 @@ class MaxBot:
                 "return_page": page,
             }
             self.admin_states[sender_id] = AdminState.AWAITING_POST_EDIT_IMAGE
-            await self.send_message(
-                sender_id,
-                "Отправьте одно сообщение с новой картинкой (фото или файл изображения). Текст поста не меняется.",
-            )
+            await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_POST_NEW_IMAGE, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_ch_detail:"):
             raw_id = payload.split(":", 1)[1]
             try:
                 dcid = int(raw_id)
             except ValueError:
-                await self.send_message(sender_id, "Некорректный id канала.")
+                await self.send_message(sender_id, rep.ERR_BAD_CHANNEL_ID)
                 return
-            await self.send_channel_detail_submenu(sender_id, dcid)
+            await self.send_channel_detail_submenu(sender_id, dcid, edit_message_id=callback_mid)
         elif payload == "usr_add_ch":
             self.channel_bind_draft.pop(sender_id, None)
             self.admin_states[sender_id] = AdminState.AWAITING_BIND_CHANNEL_INVITE
-            await self.send_message(
-                sender_id,
-                "Отправьте ссылку-приглашение в канал или числовой chat_id канала.\n"
-                "Бот уже должен быть в канале администратором с правом редактировать сообщения.",
-            )
+            await self.replace_with_prompt_or_send(sender_id, rep.BIND_CHANNEL_PROMPT, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_rm_ch:"):
             raw_id = payload.split(":", 1)[1]
             try:
                 remove_cid = int(raw_id)
             except ValueError:
-                await self.send_message(sender_id, "Некорректный id канала.")
+                await self.send_message(sender_id, rep.ERR_BAD_CHANNEL_ID)
                 return
             br = self.config.binding_for_channel(remove_cid)
             if not br or not self.can_access_channel(sender_id, br):
-                await self.send_message(sender_id, "Канал не найден или нет доступа.")
-                await self.send_channels_submenu(sender_id)
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+                )
                 return
             before = len(self.config.channel_bindings)
             self.config.channel_bindings = [b for b in self.config.channel_bindings if int(b["channel_id"]) != remove_cid]
             if len(self.config.channel_bindings) == before:
-                await self.send_message(sender_id, "Такой привязки не найдено.")
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.BINDING_REMOVE_NONE,
+                )
             else:
                 self.config.remove_tracked_posts_for_channel(remove_cid)
                 self.config.save()
-                await self.send_message(sender_id, "Привязка канала удалена.")
-            await self.send_channels_submenu(sender_id)
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.BINDING_REMOVED,
+                )
         elif payload == "usr_delegates":
-            await self.send_delegates_submenu(sender_id)
+            await self.send_delegates_submenu(sender_id, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_ch_mute:"):
             raw_id = payload.split(":", 1)[1]
             try:
                 mc = int(raw_id)
             except ValueError:
-                await self.send_message(sender_id, "Некорректный id канала.")
+                await self.send_message(sender_id, rep.ERR_BAD_CHANNEL_ID)
                 return
             bm = self.config.binding_for_channel(mc)
             if not bm or not self.can_access_channel(sender_id, bm):
-                await self.send_message(sender_id, "Канал не найден или нет доступа.")
-                await self.send_channels_submenu(sender_id)
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+                )
                 return
-            await self.send_chat_mute_submenu(sender_id, mc)
+            await self.send_chat_mute_submenu(sender_id, mc, edit_message_id=callback_mid)
         elif payload == "usr_add_del":
             self.admin_states[sender_id] = AdminState.AWAITING_NEW_ADMIN
-            await self.send_message(sender_id, "Введите user_id нового админа:")
+            await self.replace_with_prompt_or_send(
+                sender_id,
+                rep.PROMPT_DELEGATE_ID,
+                edit_message_id=callback_mid,
+            )
         elif isinstance(payload, str) and payload.startswith("usr_toggle_mute:"):
             raw_id = payload.split(":", 1)[1]
             try:
@@ -2543,16 +2756,20 @@ class MaxBot:
                 return
             b = self.config.binding_for_channel(tcid)
             if not b or not self.can_access_channel(sender_id, b):
-                await self.send_message(sender_id, "Канал не найден или нет доступа.")
-                await self.send_channels_submenu(sender_id)
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+                )
                 return
             b["chat_mute_enabled"] = not bool(b.get("chat_mute_enabled"))
             self.config.save()
-            await self.send_message(
+            await self.send_chat_mute_submenu(
                 sender_id,
-                f"Mute для этого канала {'включен' if b['chat_mute_enabled'] else 'выключен'}",
+                tcid,
+                edit_message_id=callback_mid,
+                prepend=rep.MUTE_TOGGLED.format(state=rep.mute_state_word(bool(b["chat_mute_enabled"]))),
             )
-            await self.send_chat_mute_submenu(sender_id, tcid)
         elif isinstance(payload, str) and payload.startswith("usr_mute_range:"):
             raw_id = payload.split(":", 1)[1]
             try:
@@ -2561,27 +2778,36 @@ class MaxBot:
                 return
             bm2 = self.config.binding_for_channel(mcid)
             if not bm2 or not self.can_access_channel(sender_id, bm2):
-                await self.send_message(sender_id, "Канал не найден или нет доступа.")
-                await self.send_channels_submenu(sender_id)
+                await self.send_channels_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+                )
                 return
             self.mute_range_channel_id[sender_id] = mcid
             self.admin_states[sender_id] = AdminState.AWAITING_MUTE_RANGE
-            await self.send_message(sender_id, "Введите диапазон, например 12:00-14:00 или 21:33-07:00")
+            await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_MUTE_RANGE, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_rm_del:"):
             raw_admin_id = payload.split(":", 1)[1]
             try:
                 remove_admin_id = int(raw_admin_id)
             except ValueError:
-                await self.send_message(sender_id, "Некорректный user_id для удаления.")
+                await self.send_message(sender_id, rep.ERR_BAD_USER_ID)
                 return
             if self.config.delegate_parent.get(remove_admin_id) != sender_id:
-                await self.send_message(sender_id, "Можно удалять только своих прямых делегатов.")
-                await self.send_delegates_submenu(sender_id)
+                await self.send_delegates_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.DELEGATE_REMOVE_NOT_YOURS,
+                )
                 return
             del self.config.delegate_parent[remove_admin_id]
             self.config.save()
-            await self.send_message(sender_id, f"Делегат удалён: {remove_admin_id}")
-            await self.send_delegates_submenu(sender_id)
+            await self.send_delegates_submenu(
+                sender_id,
+                edit_message_id=callback_mid,
+                prepend=rep.DELEGATE_REMOVED.format(uid=remove_admin_id),
+            )
 
 
 async def run_webhook_server(
@@ -2603,7 +2829,7 @@ async def run_webhook_server(
             {
                 "ok": True,
                 "webhook": True,
-                "detail": "События от MAX приходят POST с телом Update. Откройте в браузере только для проверки; бот отвечает в чатах MAX, не здесь.",
+                "detail": rep.WEBHOOK_GET_DETAIL,
             }
         )
 
