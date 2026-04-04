@@ -37,14 +37,11 @@ NAV_NEXT = "→"
 MASTER_ONLY_ADMIN_CMD = "Команда /admin только для мастер-админов."
 MASTER_ONLY_STATS_CMD = "Команда /stats только для мастер-админов."
 
-
-def stats_line_callback_total(n: int) -> str:
-    return f"Переходов по рекламной кнопке (учёт callback): {n}"
-
-
-def stats_line_short(n: int) -> str:
-    return f"Переходов по рекламной кнопке (callback): {n}"
-
+STATS_CHANNELS_CAPTION = (
+    "Статистика по каналам (данные из конфига и из MAX API).\n"
+    "Страница {cur} из {total_pages}. Всего каналов: {n}."
+)
+STATS_CHANNELS_EMPTY = "В конфиге пока нет привязанных каналов."
 
 # --- Меню (заголовки) ---
 USER_MENU_INTRO = (
@@ -56,7 +53,7 @@ USER_MENU_INTRO = (
 )
 
 MASTER_MENU_INTRO = (
-    "Мастер-панель: глобальная реклама, кнопки под постами, счётчик кликов по рекламе."
+    "Мастер-панель: глобальная реклама, кнопки под постами, статистика по каналам (/stats)."
 )
 
 # --- FSM / сессии ---

@@ -1,7 +1,7 @@
 """
 MAX-бот:
 1. Пользовательское меню: /start, bot_started, иной текст в ЛС — каналы и делегаты.
-2. Мастер-меню: только /admin — глобальная реклама, кнопки под постами, /stats, мастера из конфига (.env).
+2. Мастер-меню: только /admin — глобальная реклама, кнопки под постами, /stats (статистика по каналам), мастера из конфига (.env).
 3. Копия поста в чат комментариев, кнопки к посту; мут и правка постов в меню канала (трекер до 3 суток).
 """
 
@@ -35,6 +35,151 @@ API_BASE = "https://platform-api.max.ru"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 TRACKED_POST_TTL_SEC = 3 * 24 * 3600
 POSTS_PAGE_SIZE = 10
+STATS_PAGE_SIZE = 8
+
+
+def _unwrap_chat_api_dict(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not data or not isinstance(data, dict):
+        return None
+    inner = data.get("chat")
+    if isinstance(inner, dict):
+        return inner
+    return data
+
+
+def _chat_title_from_api(d: Optional[Dict[str, Any]]) -> str:
+    u = _unwrap_chat_api_dict(d)
+    if not u:
+        return "—"
+    t = (u.get("title") or u.get("name") or "").strip()
+    return t or "—"
+
+
+def _chat_members_count_from_api(d: Optional[Dict[str, Any]]) -> str:
+    u = _unwrap_chat_api_dict(d)
+    if not u:
+        return "—"
+    for key in ("participants_count", "members_count", "members_total"):
+        v = u.get(key)
+        if isinstance(v, int):
+            return str(v)
+    m = u.get("members")
+    if isinstance(m, dict):
+        c = m.get("count")
+        if isinstance(c, int):
+            return str(c)
+    if isinstance(m, list):
+        return str(len(m))
+    return "—"
+
+
+def _chat_link_from_api(d: Optional[Dict[str, Any]]) -> str:
+    u = _unwrap_chat_api_dict(d)
+    if not u:
+        return "—"
+    link = (u.get("link") or u.get("invite_link") or "").strip()
+    return link or "—"
+
+
+def _chat_type_from_api(d: Optional[Dict[str, Any]]) -> str:
+    u = _unwrap_chat_api_dict(d)
+    if not u:
+        return "—"
+    for key in ("type", "chat_type", "subtype"):
+        v = u.get(key)
+        if v is not None:
+            return str(v)
+    return "—"
+
+
+def _format_api_extra_snapshot(d: Optional[Dict[str, Any]], max_lines: int = 12) -> str:
+    u = _unwrap_chat_api_dict(d)
+    if not u:
+        return ""
+    lines: List[str] = []
+    skipped = {
+        "title",
+        "name",
+        "link",
+        "invite_link",
+        "type",
+        "chat_type",
+        "subtype",
+        "participants_count",
+        "members_count",
+        "members_total",
+        "members",
+        "participants",
+    }
+    for k in sorted(u.keys()):
+        if k in skipped:
+            continue
+        v = u[k]
+        if isinstance(v, (dict, list)):
+            continue
+        lines.append(f"{k}: {v}")
+        if len(lines) >= max_lines:
+            break
+    return "\n".join(lines)
+
+
+def _format_master_stats_detail(
+    b: Dict[str, Any],
+    ch_api: Optional[Dict[str, Any]],
+    cc_api: Optional[Dict[str, Any]],
+    tracked_posts_count: int,
+) -> str:
+    cid = int(b["channel_id"])
+    ccid = int(b["comments_chat_id"])
+    link = (b.get("comments_chat_link") or "").strip() or "—"
+    lines: List[str] = [
+        "Статистика по каналу",
+        "",
+        "— Данные из конфига —",
+        f"channel_id: {cid}",
+        f"comments_chat_id: {ccid}",
+        f"Ссылка-приглашение в чат комментариев (сохранённая): {link}",
+        f"Заголовок канала (конфиг): {b.get('channel_title') or '—'}",
+        f"Заголовок чата комментариев (конфиг): {b.get('comments_chat_title') or '—'}",
+        f"Диапазон mute (МСК): {b.get('quiet_hours') or '—'}",
+        f"Mute включён: {'да' if b.get('chat_mute_enabled') else 'нет'}",
+        f"account_root_id: {b.get('account_root_id')}",
+        f"created_by: {b.get('created_by')}",
+        f"Постов в трекере (до 3 суток): {tracked_posts_count}",
+        "",
+        "— Канал (MAX API, GET /chats/{channel_id}) —",
+        f"chat_id: {cid}",
+        f"Название: {_chat_title_from_api(ch_api)}",
+        f"Участников: {_chat_members_count_from_api(ch_api)}",
+        f"Тип: {_chat_type_from_api(ch_api)}",
+        f"Ссылка (API): {_chat_link_from_api(ch_api)}",
+    ]
+    extra_ch = _format_api_extra_snapshot(ch_api)
+    if extra_ch:
+        lines.extend(["", "Доп. поля (канал):", extra_ch])
+    lines.extend(
+        [
+            "",
+            "— Чат комментариев (MAX API, GET /chats/{comments_chat_id}) —",
+            f"chat_id: {ccid}",
+            f"Название: {_chat_title_from_api(cc_api)}",
+            f"Участников: {_chat_members_count_from_api(cc_api)}",
+            f"Тип: {_chat_type_from_api(cc_api)}",
+            f"Ссылка (API): {_chat_link_from_api(cc_api)}",
+        ]
+    )
+    extra_cc = _format_api_extra_snapshot(cc_api)
+    if extra_cc:
+        lines.extend(["", "Доп. поля (чат комментариев):", extra_cc])
+    return "\n".join(lines)
+
+
+def _stats_channel_button_label(b: Dict[str, Any]) -> str:
+    cid = int(b["channel_id"])
+    t = str(b.get("channel_title") or rep.channel_title_fallback(cid)).strip()
+    if len(t) > 60:
+        t = t[:59] + "…"
+    return t or str(cid)
 
 
 def _menu_prepend(base: str, prepend: Optional[str]) -> str:
@@ -748,7 +893,6 @@ class Config:
         self.root_admin_ids = parse_admin_ids(os.environ.get("ADMIN_USER_IDS", ""))
         self.delegate_parent: Dict[int, int] = {}
         self.promoted_master_ids: List[int] = []
-        self.ad_click_total: int = 0
         self.channel_bindings: List[Dict[str, Any]] = []
         self.tracked_posts: List[Dict[str, Any]] = []
 
@@ -786,7 +930,6 @@ class Config:
             self.comments_message_button_text = data.get(
                 "comments_message_button_text", self.comments_message_button_text
             )
-            self.ad_click_total = int(data.get("ad_click_total", self.ad_click_total))
             raw_pm = data.get("promoted_master_ids")
             self.promoted_master_ids = parse_admin_ids(raw_pm) if raw_pm is not None else []
             raw_dp = data.get("delegate_parent") or {}
@@ -1072,7 +1215,6 @@ class Config:
                         "ad_url": self.ad_url,
                         "comments_chat_text": self.comments_chat_text,
                         "comments_message_button_text": self.comments_message_button_text,
-                        "ad_click_total": self.ad_click_total,
                         "promoted_master_ids": self.promoted_master_ids,
                         "delegate_parent": {str(k): v for k, v in sorted(self.delegate_parent.items())},
                         "channel_bindings": self.channel_bindings,
@@ -1637,7 +1779,7 @@ class MaxBot:
             if not self.is_master(sender_id):
                 await self.send_message(sender_id, rep.MASTER_ONLY_STATS_CMD)
                 return
-            await self.send_message(sender_id, rep.stats_line_callback_total(self.config.ad_click_total))
+            await self.send_master_stats_channels(sender_id, 0, edit_message_id=None)
             return
 
         if _cmd("/start") or treat_as_start:
@@ -2101,6 +2243,109 @@ class MaxBot:
             edit_message_id=edit_message_id,
         )
 
+    async def send_master_stats_channels(
+        self,
+        user_id: int,
+        page: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
+        bindings = list(self.config.channel_bindings)
+        total = len(bindings)
+        if total == 0:
+            await self.show_menu_or_edit(
+                user_id,
+                _menu_prepend(rep.STATS_CHANNELS_EMPTY, prepend),
+                [
+                    {
+                        "type": "inline_keyboard",
+                        "payload": {
+                            "buttons": [
+                                [{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}]
+                            ]
+                        },
+                    }
+                ],
+                edit_message_id=edit_message_id,
+            )
+            return
+        page_size = STATS_PAGE_SIZE
+        max_page = max(0, (total - 1) // page_size)
+        page = max(0, min(page, max_page))
+        start = page * page_size
+        chunk = bindings[start : start + page_size]
+        text = _menu_prepend(
+            rep.STATS_CHANNELS_CAPTION.format(cur=page + 1, total_pages=max_page + 1, n=total),
+            prepend,
+        )
+        buttons: List[List[Dict]] = []
+        for b in chunk:
+            cid = int(b["channel_id"])
+            buttons.append(
+                [
+                    {
+                        "type": "callback",
+                        "text": _stats_channel_button_label(b),
+                        "payload": f"mst_stats_ch:{cid}:{page}",
+                    }
+                ]
+            )
+        nav: List[Dict] = []
+        if page > 0:
+            nav.append({"type": "callback", "text": rep.NAV_PREV, "payload": f"mst_stats_page:{page - 1}"})
+        if page < max_page:
+            nav.append({"type": "callback", "text": rep.NAV_NEXT, "payload": f"mst_stats_page:{page + 1}"})
+        if nav:
+            buttons.append(nav)
+        buttons.append([{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}])
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
+
+    async def send_master_stats_channel_detail(
+        self,
+        user_id: int,
+        channel_id: int,
+        return_page: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
+        b = self.config.binding_for_channel(channel_id)
+        if not b:
+            await self.send_master_stats_channels(
+                user_id,
+                return_page,
+                edit_message_id=edit_message_id,
+                prepend=prepend or rep.CHANNEL_NOT_FOUND_OR_NO_ACCESS,
+            )
+            return
+        cid = int(b["channel_id"])
+        ccid = int(b["comments_chat_id"])
+        ch_api = await self.fetch_chat_by_id(cid)
+        cc_api = await self.fetch_chat_by_id(ccid)
+        self.config.prune_tracked_posts()
+        n_posts = len(self.config.sorted_tracked_posts_for_channel(cid))
+        body = _menu_prepend(
+            _format_master_stats_detail(b, ch_api, cc_api, n_posts),
+            prepend,
+        )
+        kb = [
+            {
+                "type": "inline_keyboard",
+                "payload": {
+                    "buttons": [
+                        [{"type": "callback", "text": rep.BTN_BACK, "payload": f"mst_stats_page:{return_page}"}]
+                    ]
+                },
+            }
+        ]
+        await self.show_menu_or_edit(user_id, body, kb, edit_message_id=edit_message_id)
+
     async def send_posts_list(
         self,
         user_id: int,
@@ -2462,14 +2707,6 @@ class MaxBot:
             return
         callback_mid = message_mid_from_callback_update(update)
 
-        if payload == "mst_ad_click":
-            self.config.ad_click_total += 1
-            self.config.save()
-            u = (self.config.ad_url or "").strip()
-            if u:
-                await self.send_message(sender_id, u)
-            return
-
         if isinstance(payload, str) and payload.startswith("mst_"):
             if not self.is_master(sender_id):
                 return
@@ -2493,19 +2730,24 @@ class MaxBot:
                     prepend=rep.MSG_PROMPT_CANCELLED,
                 )
             elif payload == "mst_stats":
-                await self.show_menu_or_edit(
-                    sender_id,
-                    rep.stats_line_short(self.config.ad_click_total),
-                    [
-                        {
-                            "type": "inline_keyboard",
-                            "payload": {
-                                "buttons": [[{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}]]
-                            },
-                        }
-                    ],
-                    edit_message_id=callback_mid,
-                )
+                await self.send_master_stats_channels(sender_id, 0, edit_message_id=callback_mid)
+            elif isinstance(payload, str) and payload.startswith("mst_stats_page:"):
+                try:
+                    pg = int(payload.split(":", 1)[1])
+                except ValueError:
+                    return
+                await self.send_master_stats_channels(sender_id, pg, edit_message_id=callback_mid)
+            elif isinstance(payload, str) and payload.startswith("mst_stats_ch:"):
+                rest = payload[len("mst_stats_ch:") :]
+                parts = rest.rsplit(":", 1)
+                if len(parts) != 2:
+                    return
+                try:
+                    cid = int(parts[0])
+                    pg = int(parts[1])
+                except ValueError:
+                    return
+                await self.send_master_stats_channel_detail(sender_id, cid, pg, edit_message_id=callback_mid)
             elif payload == "mst_masters":
                 if not self.is_master_env(sender_id):
                     return
