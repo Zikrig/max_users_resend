@@ -44,16 +44,21 @@ def _menu_prepend(base: str, prepend: Optional[str]) -> str:
     return base
 
 
-def _mst_btns_prompt_back_keyboard() -> List[Dict]:
-    """Назад в подменю «Кнопки в посте» с промпта ввода текста кнопок."""
+def _prompt_cancel_keyboard(payload: str) -> List[Dict]:
+    """Одна inline-кнопка отмены ввода: текст из rep.BTN_CANCEL."""
     return [
         {
             "type": "inline_keyboard",
             "payload": {
-                "buttons": [[{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_btns"}]]
+                "buttons": [[{"type": "callback", "text": rep.BTN_CANCEL, "payload": payload}]]
             },
         }
     ]
+
+
+def _mst_btns_prompt_cancel_keyboard() -> List[Dict]:
+    """Отмена ввода текста кнопок под постом → подменю «Кнопки в посте»."""
+    return _prompt_cancel_keyboard("mst_cancel_btns")
 
 
 class MoscowFormatter(logging.Formatter):
@@ -1775,7 +1780,11 @@ class MaxBot:
                 "channel_title": title,
             }
             self.admin_states[sender_id] = AdminState.AWAITING_BIND_COMMENTS_INVITE
-            await self.send_message(sender_id, rep.CHANNEL_STEP_COMMENTS)
+            await self.send_message(
+                sender_id,
+                rep.CHANNEL_STEP_COMMENTS,
+                attachments=_prompt_cancel_keyboard("usr_bind_cancel"),
+            )
             return
 
         if state == AdminState.AWAITING_BIND_COMMENTS_INVITE:
@@ -2218,6 +2227,7 @@ class MaxBot:
         return_page: int,
         *,
         edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
     ) -> None:
         b = self.config.binding_for_channel(channel_id)
         if not b or not self.can_access_channel(user_id, b):
@@ -2240,7 +2250,7 @@ class MaxBot:
             return
         body = (p.get("text") or "").strip() or rep.EMPTY_POST_PLACEHOLDER
         ref = encode_post_ref(channel_id, message_id)
-        msg_text = f"{rep.POST_DETAIL_PREFIX}{body}"
+        msg_text = _menu_prepend(f"{rep.POST_DETAIL_PREFIX}{body}", prepend)
         buttons = [
             [{"type": "callback", "text": rep.BTN_CHANGE_POST_TEXT, "payload": f"usr_post_edit:{ref}:{return_page}:{channel_id}"}],
             [{"type": "callback", "text": rep.BTN_CHANGE_POST_IMAGE, "payload": f"usr_post_edit_img:{ref}:{return_page}:{channel_id}"}],
@@ -2509,6 +2519,13 @@ class MaxBot:
                 ):
                     self.admin_states[sender_id] = AdminState.NONE
                 await self.send_master_btns_submenu(sender_id, edit_message_id=callback_mid)
+            elif payload == "mst_cancel_btns":
+                self.admin_states[sender_id] = AdminState.NONE
+                await self.send_master_btns_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.MSG_PROMPT_CANCELLED,
+                )
             elif payload == "mst_stats":
                 await self.show_menu_or_edit(
                     sender_id,
@@ -2535,6 +2552,7 @@ class MaxBot:
                     sender_id,
                     rep.PROMPT_NEW_MASTER_ID,
                     edit_message_id=callback_mid,
+                    attachments=_prompt_cancel_keyboard("mst_cancel_masters"),
                 )
             elif isinstance(payload, str) and payload.startswith("mst_rm_master:"):
                 if not self.is_master_env(sender_id):
@@ -2550,15 +2568,37 @@ class MaxBot:
                     edit_message_id=callback_mid,
                     prepend=rep.PROMOTED_REMOVED.format(mid=rm_mid),
                 )
+            elif payload == "mst_cancel_ad":
+                self.admin_states[sender_id] = AdminState.NONE
+                await self.send_master_ad_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.MSG_PROMPT_CANCELLED,
+                )
+            elif payload == "mst_cancel_masters":
+                if not self.is_master_env(sender_id):
+                    return
+                self.admin_states[sender_id] = AdminState.NONE
+                await self.send_master_masters_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.MSG_PROMPT_CANCELLED,
+                )
             elif payload == "mst_set_adtxt":
                 self.admin_states[sender_id] = AdminState.AWAITING_AD_TEXT
-                await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_AD_TEXT, edit_message_id=callback_mid)
+                await self.replace_with_prompt_or_send(
+                    sender_id,
+                    rep.PROMPT_AD_TEXT,
+                    edit_message_id=callback_mid,
+                    attachments=_prompt_cancel_keyboard("mst_cancel_ad"),
+                )
             elif payload == "mst_set_adurl":
                 self.admin_states[sender_id] = AdminState.AWAITING_AD_LINK
                 await self.replace_with_prompt_or_send(
                     sender_id,
                     rep.PROMPT_AD_URL,
                     edit_message_id=callback_mid,
+                    attachments=_prompt_cancel_keyboard("mst_cancel_ad"),
                 )
             elif payload == "mst_set_chtxt":
                 self.admin_states[sender_id] = AdminState.AWAITING_CHAT_TEXT
@@ -2566,7 +2606,7 @@ class MaxBot:
                     sender_id,
                     rep.PROMPT_CHAT_BTN,
                     edit_message_id=callback_mid,
-                    attachments=_mst_btns_prompt_back_keyboard(),
+                    attachments=_mst_btns_prompt_cancel_keyboard(),
                 )
             elif payload == "mst_set_msgbtn":
                 self.admin_states[sender_id] = AdminState.AWAITING_COMMENTS_MESSAGE_BUTTON_TEXT
@@ -2574,7 +2614,7 @@ class MaxBot:
                     sender_id,
                     rep.PROMPT_MSG_BTN,
                     edit_message_id=callback_mid,
-                    attachments=_mst_btns_prompt_back_keyboard(),
+                    attachments=_mst_btns_prompt_cancel_keyboard(),
                 )
             return
 
@@ -2680,7 +2720,12 @@ class MaxBot:
                 "return_page": page,
             }
             self.admin_states[sender_id] = AdminState.AWAITING_POST_EDIT_TEXT
-            await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_POST_NEW_TEXT, edit_message_id=callback_mid)
+            await self.replace_with_prompt_or_send(
+                sender_id,
+                rep.PROMPT_POST_NEW_TEXT,
+                edit_message_id=callback_mid,
+                attachments=_prompt_cancel_keyboard("usr_cancel_post_edit"),
+            )
         elif isinstance(payload, str) and payload.startswith("usr_post_edit_img:"):
             rest = payload[len("usr_post_edit_img:") :]
             parts = rest.rsplit(":", 2)
@@ -2735,7 +2780,12 @@ class MaxBot:
                 "return_page": page,
             }
             self.admin_states[sender_id] = AdminState.AWAITING_POST_EDIT_IMAGE
-            await self.replace_with_prompt_or_send(sender_id, rep.PROMPT_POST_NEW_IMAGE, edit_message_id=callback_mid)
+            await self.replace_with_prompt_or_send(
+                sender_id,
+                rep.PROMPT_POST_NEW_IMAGE,
+                edit_message_id=callback_mid,
+                attachments=_prompt_cancel_keyboard("usr_cancel_post_edit"),
+            )
         elif isinstance(payload, str) and payload.startswith("usr_ch_detail:"):
             raw_id = payload.split(":", 1)[1]
             try:
@@ -2744,10 +2794,47 @@ class MaxBot:
                 await self.send_message(sender_id, rep.ERR_BAD_CHANNEL_ID)
                 return
             await self.send_channel_detail_submenu(sender_id, dcid, edit_message_id=callback_mid)
+        elif payload == "usr_bind_cancel":
+            self.admin_states[sender_id] = AdminState.NONE
+            self.channel_bind_draft.pop(sender_id, None)
+            await self.send_channels_submenu(
+                sender_id,
+                edit_message_id=callback_mid,
+                prepend=rep.MSG_PROMPT_CANCELLED,
+            )
+        elif payload == "usr_delegate_cancel":
+            self.admin_states[sender_id] = AdminState.NONE
+            await self.send_delegates_submenu(
+                sender_id,
+                edit_message_id=callback_mid,
+                prepend=rep.MSG_PROMPT_CANCELLED,
+            )
+        elif payload == "usr_cancel_post_edit":
+            ctx = self.post_edit_ref.pop(sender_id, None)
+            self.admin_states[sender_id] = AdminState.NONE
+            if not ctx:
+                await self.send_user_menu(sender_id, edit_message_id=callback_mid, prepend=rep.MSG_PROMPT_CANCELLED)
+                return
+            cid = int(ctx["channel_id"])
+            mid = str(ctx["message_id"])
+            page = int(ctx["return_page"])
+            await self.send_post_detail(
+                sender_id,
+                cid,
+                mid,
+                page,
+                edit_message_id=callback_mid,
+                prepend=rep.MSG_PROMPT_CANCELLED,
+            )
         elif payload == "usr_add_ch":
             self.channel_bind_draft.pop(sender_id, None)
             self.admin_states[sender_id] = AdminState.AWAITING_BIND_CHANNEL_INVITE
-            await self.replace_with_prompt_or_send(sender_id, rep.BIND_CHANNEL_PROMPT, edit_message_id=callback_mid)
+            await self.replace_with_prompt_or_send(
+                sender_id,
+                rep.BIND_CHANNEL_PROMPT,
+                edit_message_id=callback_mid,
+                attachments=_prompt_cancel_keyboard("usr_bind_cancel"),
+            )
         elif isinstance(payload, str) and payload.startswith("usr_rm_ch:"):
             raw_id = payload.split(":", 1)[1]
             try:
@@ -2803,6 +2890,7 @@ class MaxBot:
                 sender_id,
                 rep.PROMPT_DELEGATE_ID,
                 edit_message_id=callback_mid,
+                attachments=_prompt_cancel_keyboard("usr_delegate_cancel"),
             )
         elif isinstance(payload, str) and payload.startswith("usr_toggle_mute:"):
             raw_id = payload.split(":", 1)[1]
@@ -2842,27 +2930,11 @@ class MaxBot:
                 return
             self.mute_range_channel_id[sender_id] = mcid
             self.admin_states[sender_id] = AdminState.AWAITING_MUTE_RANGE
-            mute_back_kb = [
-                {
-                    "type": "inline_keyboard",
-                    "payload": {
-                        "buttons": [
-                            [
-                                {
-                                    "type": "callback",
-                                    "text": rep.BTN_BACK,
-                                    "payload": f"usr_mute_range_cancel:{mcid}",
-                                }
-                            ]
-                        ]
-                    },
-                }
-            ]
             await self.replace_with_prompt_or_send(
                 sender_id,
                 rep.PROMPT_MUTE_RANGE,
                 edit_message_id=callback_mid,
-                attachments=mute_back_kb,
+                attachments=_prompt_cancel_keyboard(f"usr_mute_range_cancel:{mcid}"),
             )
         elif isinstance(payload, str) and payload.startswith("usr_mute_range_cancel:"):
             raw_id = payload.split(":", 1)[1]
@@ -2880,7 +2952,12 @@ class MaxBot:
                 return
             self.admin_states[sender_id] = AdminState.NONE
             self.mute_range_channel_id.pop(sender_id, None)
-            await self.send_chat_mute_submenu(sender_id, ccancel, edit_message_id=callback_mid)
+            await self.send_chat_mute_submenu(
+                sender_id,
+                ccancel,
+                edit_message_id=callback_mid,
+                prepend=rep.MSG_PROMPT_CANCELLED,
+            )
         elif isinstance(payload, str) and payload.startswith("usr_rm_del:"):
             raw_admin_id = payload.split(":", 1)[1]
             try:
