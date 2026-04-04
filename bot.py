@@ -1107,38 +1107,12 @@ class MaxBot:
             user_id is not None and user_id in self.config.promoted_master_ids
         )
 
-    def participant_user_ids(self) -> set[int]:
-        s: set[int] = set()
-        s.update(self.config.root_admin_ids)
-        s.update(self.config.promoted_master_ids)
-        for k, v in self.config.delegate_parent.items():
-            s.add(int(k))
-            s.add(int(v))
-        for b in self.config.channel_bindings:
-            s.add(int(b["account_root_id"]))
-            s.add(int(b["created_by"]))
-        return s
-
     def can_use_user_menu(self, user_id: int | None) -> bool:
-        if user_id is None:
-            return False
-        if self.is_master(user_id):
-            return True
-        return user_id in self.participant_user_ids()
+        return user_id is not None
 
-    def can_access_channel(self, user_id: int | None, b: Dict[str, Any]) -> bool:
-        if user_id is None:
-            return False
-        if self.is_master(user_id):
-            return True
-        ar = int(b["account_root_id"])
-        cb = int(b["created_by"])
-        if self.config.account_root_for(user_id) != ar:
-            return False
-        if user_id == ar:
-            return True
-        parent = self.config.delegate_parent.get(user_id)
-        return cb == user_id or (parent is not None and cb == parent)
+    def can_access_channel(self, user_id: int | None, _b: Dict[str, Any]) -> bool:
+        """Доступ к настройкам привязки: любой пользователь, написавший боту в ЛС."""
+        return user_id is not None
 
     def bindings_visible(self, user_id: int) -> List[Dict[str, Any]]:
         return [b for b in self.config.channel_bindings if self.can_access_channel(user_id, b)]
@@ -1531,9 +1505,6 @@ class MaxBot:
             await self.process_private_message(msg)
             return
 
-        if sender_id is not None and (chat_id is None or chat_id not in public_ids):
-            await self.send_message(sender_id, rep.GUEST_NO_ACCESS)
-
     async def process_channel_post(self, msg: Dict[str, Any]) -> None:
         message_id = msg.get("body", {}).get("mid")
         recipient = msg.get("recipient", {})
@@ -1639,8 +1610,7 @@ class MaxBot:
         if user_id is None:
             logger.info("bot_started: user_id не найден в update")
             return
-        if self.can_use_user_menu(user_id):
-            await self.send_user_menu(user_id)
+        await self.send_user_menu(user_id)
 
     async def process_private_message(
         self, msg: Dict[str, Any], *, treat_as_start: bool = False
@@ -1654,10 +1624,6 @@ class MaxBot:
 
         def _cmd(name: str) -> bool:
             return tl == name or tl.startswith(name + "@")
-
-        if not self.can_use_user_menu(sender_id):
-            await self.send_message(sender_id, rep.ACCESS_DENIED)
-            return
 
         if _cmd("/admin"):
             if not self.is_master(sender_id):
