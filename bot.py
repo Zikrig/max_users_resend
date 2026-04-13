@@ -1273,9 +1273,15 @@ class MaxBot:
     def can_use_user_menu(self, user_id: int | None) -> bool:
         return user_id is not None
 
-    def can_access_channel(self, user_id: int | None, _b: Dict[str, Any]) -> bool:
-        """Доступ к настройкам привязки: любой пользователь, написавший боту в ЛС."""
-        return user_id is not None
+    def can_access_channel(self, user_id: int | None, b: Dict[str, Any]) -> bool:
+        """Доступ к привязке: только «свой» аккаунт (дерево delegate_parent → общий account_root_id)."""
+        if user_id is None:
+            return False
+        try:
+            binding_root = int(b["account_root_id"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return self.config.account_root_for(user_id) == binding_root
 
     def bindings_visible(self, user_id: int) -> List[Dict[str, Any]]:
         return [b for b in self.config.channel_bindings if self.can_access_channel(user_id, b)]
