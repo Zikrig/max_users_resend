@@ -1,6 +1,7 @@
 /.env
 .env.test
 config.json
+/data/
 .env.fight
 /__pycache__
 .env*

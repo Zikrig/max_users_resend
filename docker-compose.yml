@@ -17,4 +17,4 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app  # Это сохраняет config.json даже после удаления контейнера
+      - .:/app  # data/app.db и папка дампов data/backups на хосте

@@ -233,7 +233,7 @@ def master_btns_inline_labels(chat_btn: str, msg_btn: str) -> tuple[str, str]:
     )
 
 
-MASTER_LIST_HEADER = "Мастер-админы (хранятся в config.json, не в .env)."
+MASTER_LIST_HEADER = "Мастер-админы (хранятся в базе бота, не в .env)."
 MASTER_LIST_LINE = "Список: {items}"
 
 

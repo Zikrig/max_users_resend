@@ -16,12 +16,13 @@ import re
 import struct
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import config_store
 import httpx
 import replies as rep
 import uvicorn
@@ -882,8 +883,10 @@ def check_comments_chat_admin_permissions(m: dict) -> tuple[bool, str]:
 
 
 class Config:
-    def __init__(self, filename: str = "config.json"):
-        self.filename = filename
+    def __init__(self, db_path: str | None = None, legacy_json_path: str = "config.json"):
+        raw_db = (os.environ.get("SQLITE_PATH") or "").strip()
+        self.db_path = db_path or (raw_db or os.path.join("data", "app.db"))
+        self.legacy_json_path = legacy_json_path
         self.ad_text = os.environ.get("AD_TEXT", "Реклама")
         self.ad_url = os.environ.get("AD_URL", "https://max.ru")
         self.comments_chat_text = os.environ.get("COMMENTS_CHAT_TEXT", "Чат комментариев")
@@ -896,7 +899,7 @@ class Config:
         self.channel_bindings: List[Dict[str, Any]] = []
         self.tracked_posts: List[Dict[str, Any]] = []
 
-        self.load()
+        self._load_initial()
         self.promoted_master_ids = sorted(
             set(x for x in self.promoted_master_ids if x not in self.root_admin_ids)
         )
@@ -918,45 +921,79 @@ class Config:
             cur = self.delegate_parent[cur]
         return cur
 
-    def load(self) -> None:
-        if not os.path.exists(self.filename):
-            return
-        try:
-            with open(self.filename, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.ad_text = data.get("ad_text", self.ad_text)
-            self.ad_url = data.get("ad_url", self.ad_url)
-            self.comments_chat_text = data.get("comments_chat_text", self.comments_chat_text)
-            self.comments_message_button_text = data.get(
-                "comments_message_button_text", self.comments_message_button_text
-            )
-            raw_pm = data.get("promoted_master_ids")
-            self.promoted_master_ids = parse_admin_ids(raw_pm) if raw_pm is not None else []
-            raw_dp = data.get("delegate_parent") or {}
-            self.delegate_parent = {}
-            if isinstance(raw_dp, dict):
-                for k, v in raw_dp.items():
-                    try:
-                        self.delegate_parent[int(k)] = int(v)
-                    except (TypeError, ValueError):
-                        logger.warning("Skipping invalid delegate_parent entry: %s -> %s", k, v)
-            legacy_admins = [
-                x for x in parse_admin_ids(data.get("admin_ids")) if x not in self.root_admin_ids
-            ]
-            if not self.delegate_parent and legacy_admins:
-                root = legacy_admins[0]
-                for a in legacy_admins[1:]:
-                    self.delegate_parent[a] = root
-            migration_root: Optional[int] = None
-            if legacy_admins:
-                migration_root = legacy_admins[0]
-            elif self.root_admin_ids and len(self.root_admin_ids) == 1:
-                migration_root = self.root_admin_ids[0]
-            self.channel_bindings = self._load_channel_bindings(data, migration_root=migration_root)
-            self.tracked_posts = self._load_tracked_posts(data)
-            logger.info("Config loaded from file.")
-        except Exception as e:
-            logger.error("Failed to load config file: %s", e)
+    def _merge_state_from_dict(self, data: Dict[str, Any]) -> None:
+        self.ad_text = data.get("ad_text", self.ad_text)
+        self.ad_url = data.get("ad_url", self.ad_url)
+        self.comments_chat_text = data.get("comments_chat_text", self.comments_chat_text)
+        self.comments_message_button_text = data.get(
+            "comments_message_button_text", self.comments_message_button_text
+        )
+        raw_pm = data.get("promoted_master_ids")
+        self.promoted_master_ids = parse_admin_ids(raw_pm) if raw_pm is not None else []
+        raw_dp = data.get("delegate_parent") or {}
+        self.delegate_parent = {}
+        if isinstance(raw_dp, dict):
+            for k, v in raw_dp.items():
+                try:
+                    self.delegate_parent[int(k)] = int(v)
+                except (TypeError, ValueError):
+                    logger.warning("Skipping invalid delegate_parent entry: %s -> %s", k, v)
+        legacy_admins = [
+            x for x in parse_admin_ids(data.get("admin_ids")) if x not in self.root_admin_ids
+        ]
+        if not self.delegate_parent and legacy_admins:
+            root = legacy_admins[0]
+            for a in legacy_admins[1:]:
+                self.delegate_parent[a] = root
+        migration_root: Optional[int] = None
+        if legacy_admins:
+            migration_root = legacy_admins[0]
+        elif self.root_admin_ids and len(self.root_admin_ids) == 1:
+            migration_root = self.root_admin_ids[0]
+        self.channel_bindings = self._load_channel_bindings(data, migration_root=migration_root)
+        self.tracked_posts = self._load_tracked_posts(data)
+
+    def _load_initial(self) -> None:
+        loaded = False
+        state = config_store.read_state(self.db_path)
+        if state is not None:
+            try:
+                self._merge_state_from_dict(state)
+                loaded = True
+                logger.info("Конфиг загружен из SQLite (%s).", self.db_path)
+            except Exception as e:
+                logger.error("Не удалось применить данные из SQLite: %s", e)
+
+        if not loaded and os.path.isfile(self.legacy_json_path):
+            try:
+                with open(self.legacy_json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._merge_state_from_dict(data)
+                self.save()
+                os.remove(self.legacy_json_path)
+                logger.info(
+                    "Данные из %s перенесены в SQLite, файл удалён.",
+                    self.legacy_json_path,
+                )
+                loaded = True
+            except Exception as e:
+                logger.error("Миграция из config.json не удалась: %s", e)
+
+        if not loaded:
+            logger.info("Конфигурация по умолчанию (нет SQLite и %s).", self.legacy_json_path)
+
+    def _to_persistent_dict(self) -> Dict[str, Any]:
+        self.prune_tracked_posts()
+        return {
+            "ad_text": self.ad_text,
+            "ad_url": self.ad_url,
+            "comments_chat_text": self.comments_chat_text,
+            "comments_message_button_text": self.comments_message_button_text,
+            "promoted_master_ids": self.promoted_master_ids,
+            "delegate_parent": {str(k): v for k, v in sorted(self.delegate_parent.items())},
+            "channel_bindings": self.channel_bindings,
+            "tracked_posts": self.tracked_posts,
+        }
 
     def _load_channel_bindings(
         self, data: Dict[str, Any], migration_root: Optional[int] = None
@@ -1206,27 +1243,11 @@ class Config:
         self.tracked_posts = [p for p in self.tracked_posts if int(p["channel_id"]) != int(channel_id)]
 
     def save(self) -> None:
-        self.prune_tracked_posts()
         try:
-            with open(self.filename, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "ad_text": self.ad_text,
-                        "ad_url": self.ad_url,
-                        "comments_chat_text": self.comments_chat_text,
-                        "comments_message_button_text": self.comments_message_button_text,
-                        "promoted_master_ids": self.promoted_master_ids,
-                        "delegate_parent": {str(k): v for k, v in sorted(self.delegate_parent.items())},
-                        "channel_bindings": self.channel_bindings,
-                        "tracked_posts": self.tracked_posts,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            logger.info("Config saved to file.")
+            config_store.write_state(self.db_path, self._to_persistent_dict())
+            logger.info("Конфиг сохранён в SQLite (%s).", self.db_path)
         except Exception as e:
-            logger.error("Failed to save config file: %s", e)
+            logger.error("Не удалось сохранить конфиг в SQLite: %s", e)
 
 
 class MaxBot:
@@ -3294,6 +3315,27 @@ async def run_webhook_server(
                 logger.warning("Отписка webhook не удалась: %s", e)
 
 
+def _sqlite_paths_from_env() -> tuple[str, str]:
+    raw_db = (os.environ.get("SQLITE_PATH") or "").strip()
+    db_path = raw_db or os.path.join("data", "app.db")
+    raw_b = (os.environ.get("SQLITE_BACKUP_DIR") or "").strip()
+    backup_dir = raw_b or os.path.join("data", "backups")
+    return db_path, backup_dir
+
+
+async def daily_sqlite_backup_loop() -> None:
+    """Раз в сутки (по полуночи Europe/Moscow) — SQL-дамп и удаление файлов старше 7 дней."""
+    db_path, backup_dir = _sqlite_paths_from_env()
+    while True:
+        now = datetime.now(MOSCOW_TZ)
+        next_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        await asyncio.sleep((next_midnight - now).total_seconds())
+        try:
+            config_store.backup_now(db_path, backup_dir)
+        except Exception:
+            logger.exception("Ежедневный дамп SQLite не удался")
+
+
 async def main() -> None:
     token = os.environ.get("MAX_BOT_TOKEN")
     if not token:
@@ -3320,9 +3362,15 @@ async def main() -> None:
         return
 
     bot = MaxBot(token, Config())
+    backup_task = asyncio.create_task(daily_sqlite_backup_loop())
     try:
         await run_webhook_server(bot, webhook_url, webhook_secret, listen_host, listen_port)
     finally:
+        backup_task.cancel()
+        try:
+            await backup_task
+        except asyncio.CancelledError:
+            pass
         await bot.client.aclose()
 
 
