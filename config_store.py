@@ -51,7 +51,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
             ad_url TEXT NOT NULL,
             comments_chat_text TEXT NOT NULL,
             comments_message_button_text TEXT NOT NULL,
-            promoted_master_ids TEXT NOT NULL
+            promoted_master_ids TEXT NOT NULL,
+            instruction_text TEXT NOT NULL DEFAULT '',
+            instruction_button_text TEXT NOT NULL DEFAULT 'Инструкция',
+            instruction_enabled INTEGER NOT NULL DEFAULT 1,
+            instruction_text_format TEXT,
+            instruction_markup TEXT
         );
 
         CREATE TABLE IF NOT EXISTS users (
@@ -95,6 +100,26 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '2')"
     )
+    settings_cols = {
+        str(r["name"])
+        for r in conn.execute("PRAGMA table_info(settings)")
+    }
+    if "instruction_text" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN instruction_text TEXT NOT NULL DEFAULT ''"
+        )
+    if "instruction_button_text" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN instruction_button_text TEXT NOT NULL DEFAULT 'Инструкция'"
+        )
+    if "instruction_enabled" not in settings_cols:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN instruction_enabled INTEGER NOT NULL DEFAULT 1"
+        )
+    if "instruction_text_format" not in settings_cols:
+        conn.execute("ALTER TABLE settings ADD COLUMN instruction_text_format TEXT")
+    if "instruction_markup" not in settings_cols:
+        conn.execute("ALTER TABLE settings ADD COLUMN instruction_markup TEXT")
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -197,14 +222,28 @@ def _write_payload_to_tables(conn: sqlite3.Connection, data: Dict[str, Any]) -> 
 
     conn.execute(
         """INSERT OR REPLACE INTO settings (
-            id, ad_text, ad_url, comments_chat_text, comments_message_button_text, promoted_master_ids
-        ) VALUES (1, ?, ?, ?, ?, ?)""",
+            id, ad_text, ad_url, comments_chat_text, comments_message_button_text, promoted_master_ids,
+            instruction_text, instruction_button_text, instruction_enabled, instruction_text_format, instruction_markup
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             str(data.get("ad_text", "")),
             str(data.get("ad_url", "")),
             str(data.get("comments_chat_text", "")),
             str(data.get("comments_message_button_text", "")),
             json.dumps(promoted, ensure_ascii=False),
+            str(data.get("instruction_text", "")),
+            str(data.get("instruction_button_text", "Инструкция")),
+            1 if bool(data.get("instruction_enabled", True)) else 0,
+            (
+                str(data.get("instruction_text_format"))
+                if data.get("instruction_text_format") in ("markdown", "html")
+                else None
+            ),
+            (
+                json.dumps(data.get("instruction_markup"), ensure_ascii=False)
+                if isinstance(data.get("instruction_markup"), list)
+                else None
+            ),
         ),
     )
 
@@ -375,12 +414,30 @@ def load_config(db_path: str) -> Optional[Dict[str, Any]]:
             "SELECT * FROM tracked_posts ORDER BY saved_at DESC"
         ):
             tracked.append(_row_to_tracked_post(r))
+        raw_instruction_markup = srow["instruction_markup"]
+        instruction_markup: List[Dict[str, Any]] = []
+        if raw_instruction_markup:
+            try:
+                parsed_markup = json.loads(raw_instruction_markup)
+                if isinstance(parsed_markup, list):
+                    instruction_markup = [dict(x) for x in parsed_markup if isinstance(x, dict)]
+            except json.JSONDecodeError:
+                instruction_markup = []
 
         return {
             "ad_text": str(srow["ad_text"]),
             "ad_url": str(srow["ad_url"]),
             "comments_chat_text": str(srow["comments_chat_text"]),
             "comments_message_button_text": str(srow["comments_message_button_text"]),
+            "instruction_text": str(srow["instruction_text"] or ""),
+            "instruction_button_text": str(srow["instruction_button_text"] or "Инструкция"),
+            "instruction_enabled": bool(srow["instruction_enabled"]),
+            "instruction_text_format": (
+                str(srow["instruction_text_format"])
+                if srow["instruction_text_format"] in ("markdown", "html")
+                else None
+            ),
+            "instruction_markup": instruction_markup,
             "promoted_master_ids": promoted,
             "delegate_parent": delegate_parent,
             "channel_bindings": bindings,

@@ -316,6 +316,8 @@ class AdminState(Enum):
     AWAITING_AD_LINK = "awaiting_ad_link"
     AWAITING_CHAT_TEXT = "awaiting_chat_text"
     AWAITING_COMMENTS_MESSAGE_BUTTON_TEXT = "awaiting_comments_message_button_text"
+    AWAITING_INSTRUCTION_TEXT = "awaiting_instruction_text"
+    AWAITING_INSTRUCTION_BUTTON_TEXT = "awaiting_instruction_button_text"
     AWAITING_BIND_CHANNEL_INVITE = "awaiting_bind_channel_invite"
     AWAITING_BIND_COMMENTS_INVITE = "awaiting_bind_comments_invite"
     AWAITING_NEW_ADMIN = "awaiting_new_admin"
@@ -893,6 +895,16 @@ class Config:
         self.comments_message_button_text = os.environ.get(
             "COMMENTS_MESSAGE_BUTTON_TEXT", "💬 Перейти к сообщению"
         )
+        self.instruction_text = os.environ.get("INSTRUCTION_TEXT", "")
+        self.instruction_button_text = os.environ.get("INSTRUCTION_BUTTON_TEXT", "Инструкция")
+        self.instruction_enabled = str(os.environ.get("INSTRUCTION_ENABLED", "1")).strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        self.instruction_text_format: Optional[str] = None
+        self.instruction_markup: List[Dict[str, Any]] = []
         self.root_admin_ids = parse_admin_ids(os.environ.get("ADMIN_USER_IDS", ""))
         self.delegate_parent: Dict[int, int] = {}
         self.promoted_master_ids: List[int] = []
@@ -928,6 +940,18 @@ class Config:
         self.comments_message_button_text = data.get(
             "comments_message_button_text", self.comments_message_button_text
         )
+        self.instruction_text = str(data.get("instruction_text", self.instruction_text) or "")
+        self.instruction_button_text = str(
+            data.get("instruction_button_text", self.instruction_button_text) or "Инструкция"
+        )
+        self.instruction_enabled = bool(data.get("instruction_enabled", self.instruction_enabled))
+        incoming_tf = data.get("instruction_text_format")
+        self.instruction_text_format = incoming_tf if incoming_tf in ("markdown", "html") else None
+        raw_instruction_markup = data.get("instruction_markup")
+        if isinstance(raw_instruction_markup, list):
+            self.instruction_markup = [dict(x) for x in raw_instruction_markup if isinstance(x, dict)]
+        else:
+            self.instruction_markup = []
         raw_pm = data.get("promoted_master_ids")
         self.promoted_master_ids = parse_admin_ids(raw_pm) if raw_pm is not None else []
         raw_dp = data.get("delegate_parent") or {}
@@ -989,6 +1013,11 @@ class Config:
             "ad_url": self.ad_url,
             "comments_chat_text": self.comments_chat_text,
             "comments_message_button_text": self.comments_message_button_text,
+            "instruction_text": self.instruction_text,
+            "instruction_button_text": self.instruction_button_text,
+            "instruction_enabled": self.instruction_enabled,
+            "instruction_text_format": self.instruction_text_format,
+            "instruction_markup": self.instruction_markup,
             "promoted_master_ids": self.promoted_master_ids,
             "delegate_parent": {str(k): v for k, v in sorted(self.delegate_parent.items())},
             "channel_bindings": self.channel_bindings,
@@ -1788,7 +1817,11 @@ class MaxBot:
         if raw_sid is None:
             return
         sender_id = int(raw_sid)
-        text = (msg.get("body", {}).get("text") or "").strip()
+        msg_body = msg.get("body") or {}
+        if not isinstance(msg_body, dict):
+            msg_body = {}
+        text, in_tf, in_markup = message_body_text_format_markup(msg_body)
+        text = text.strip()
         tl = text.lower()
 
         def _cmd(name: str) -> bool:
@@ -1821,6 +1854,8 @@ class MaxBot:
             AdminState.AWAITING_AD_LINK,
             AdminState.AWAITING_CHAT_TEXT,
             AdminState.AWAITING_COMMENTS_MESSAGE_BUTTON_TEXT,
+            AdminState.AWAITING_INSTRUCTION_TEXT,
+            AdminState.AWAITING_INSTRUCTION_BUTTON_TEXT,
             AdminState.AWAITING_NEW_PROMOTED_MASTER,
         )
         if state in master_states and not self.is_master(sender_id):
@@ -1859,6 +1894,27 @@ class MaxBot:
             self.admin_states[sender_id] = AdminState.NONE
             await self.send_message(sender_id, rep.CHAT_BTN_TEXT_CHANGED.format(text=text))
             await self.send_master_btns_submenu(sender_id)
+            return
+
+        if state == AdminState.AWAITING_INSTRUCTION_TEXT:
+            self.config.instruction_text = text
+            self.config.instruction_text_format = in_tf if in_tf in ("markdown", "html") else None
+            self.config.instruction_markup = [dict(x) for x in in_markup] if in_markup else []
+            self.config.save()
+            self.admin_states[sender_id] = AdminState.NONE
+            await self.send_message(sender_id, rep.INSTRUCTION_TEXT_CHANGED)
+            await self.send_master_instruction_submenu(sender_id)
+            return
+
+        if state == AdminState.AWAITING_INSTRUCTION_BUTTON_TEXT:
+            self.config.instruction_button_text = text or rep.BTN_INSTRUCTION
+            self.config.save()
+            self.admin_states[sender_id] = AdminState.NONE
+            await self.send_message(
+                sender_id,
+                rep.INSTRUCTION_BUTTON_TEXT_CHANGED.format(text=self.config.instruction_button_text),
+            )
+            await self.send_master_instruction_submenu(sender_id)
             return
 
         if state == AdminState.AWAITING_NEW_PROMOTED_MASTER:
@@ -2240,6 +2296,16 @@ class MaxBot:
             [{"type": "callback", "text": rep.BTN_CHANNELS, "payload": "usr_channels"}],
             [{"type": "callback", "text": rep.BTN_DELEGATES, "payload": "usr_delegates"}],
         ]
+        if self.config.instruction_enabled:
+            buttons.append(
+                [
+                    {
+                        "type": "callback",
+                        "text": (self.config.instruction_button_text or rep.BTN_INSTRUCTION)[:64],
+                        "payload": "usr_instruction",
+                    }
+                ]
+            )
         text = _menu_prepend(rep.USER_MENU_INTRO, prepend)
         await self.show_menu_or_edit(
             user_id,
@@ -2258,6 +2324,7 @@ class MaxBot:
         buttons: List[List[Dict]] = [
             [{"type": "callback", "text": rep.BTN_AD_LINK, "payload": "mst_ad"}],
             [{"type": "callback", "text": rep.BTN_POST_BUTTONS, "payload": "mst_btns"}],
+            [{"type": "callback", "text": rep.BTN_INSTRUCTION, "payload": "mst_instruction"}],
             [{"type": "callback", "text": rep.BTN_STATS, "payload": "mst_stats"}],
         ]
         if self.is_master_env(user_id):
@@ -2596,6 +2663,62 @@ class MaxBot:
             edit_message_id=edit_message_id,
         )
 
+    async def send_master_instruction_submenu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
+        enabled_text = rep.INSTRUCTION_VISIBLE_YES if self.config.instruction_enabled else rep.INSTRUCTION_VISIBLE_NO
+        toggle_text = rep.BTN_TOGGLE_OFF if self.config.instruction_enabled else rep.BTN_TOGGLE_ON
+        instruction_text = (self.config.instruction_text or "").strip() or rep.INSTRUCTION_EMPTY_PLACEHOLDER
+        text = _menu_prepend(
+            rep.MASTER_INSTRUCTION_SUBMENU.format(
+                button_text=self.config.instruction_button_text or rep.BTN_INSTRUCTION,
+                enabled=enabled_text,
+                instruction_text=instruction_text,
+            ),
+            prepend,
+        )
+        buttons = [
+            [{"type": "callback", "text": rep.BTN_CHANGE_TEXT, "payload": "mst_set_instruction_text"}],
+            [{"type": "callback", "text": rep.BTN_CHANGE_BUTTON, "payload": "mst_set_instruction_btn"}],
+            [{"type": "callback", "text": toggle_text, "payload": "mst_toggle_instruction"}],
+            [{"type": "callback", "text": rep.BTN_BACK, "payload": "mst_menu"}],
+        ]
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+            edit_message_id=edit_message_id,
+        )
+
+    async def send_user_instruction_submenu(
+        self,
+        user_id: int,
+        *,
+        edit_message_id: Optional[str] = None,
+        prepend: Optional[str] = None,
+    ) -> None:
+        text = _menu_prepend(
+            (self.config.instruction_text or "").strip() or rep.INSTRUCTION_EMPTY_PLACEHOLDER,
+            prepend,
+        )
+        await self.show_menu_or_edit(
+            user_id,
+            text,
+            [
+                {
+                    "type": "inline_keyboard",
+                    "payload": {"buttons": [[{"type": "callback", "text": rep.BTN_BACK, "payload": "usr_menu"}]]},
+                }
+            ],
+            text_format=self.config.instruction_text_format,
+            markup=(self.config.instruction_markup or None),
+            edit_message_id=edit_message_id,
+        )
+
     async def send_channels_submenu(
         self,
         user_id: int,
@@ -2749,9 +2872,21 @@ class MaxBot:
                 ):
                     self.admin_states[sender_id] = AdminState.NONE
                 await self.send_master_btns_submenu(sender_id, edit_message_id=callback_mid)
+            elif payload == "mst_instruction":
+                st = self.admin_states.get(sender_id, AdminState.NONE)
+                if st in (AdminState.AWAITING_INSTRUCTION_TEXT, AdminState.AWAITING_INSTRUCTION_BUTTON_TEXT):
+                    self.admin_states[sender_id] = AdminState.NONE
+                await self.send_master_instruction_submenu(sender_id, edit_message_id=callback_mid)
             elif payload == "mst_cancel_btns":
                 self.admin_states[sender_id] = AdminState.NONE
                 await self.send_master_btns_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.MSG_PROMPT_CANCELLED,
+                )
+            elif payload == "mst_cancel_instruction":
+                self.admin_states[sender_id] = AdminState.NONE
+                await self.send_master_instruction_submenu(
                     sender_id,
                     edit_message_id=callback_mid,
                     prepend=rep.MSG_PROMPT_CANCELLED,
@@ -2851,6 +2986,31 @@ class MaxBot:
                     edit_message_id=callback_mid,
                     attachments=_mst_btns_prompt_cancel_keyboard(),
                 )
+            elif payload == "mst_set_instruction_text":
+                self.admin_states[sender_id] = AdminState.AWAITING_INSTRUCTION_TEXT
+                await self.replace_with_prompt_or_send(
+                    sender_id,
+                    rep.PROMPT_INSTRUCTION_TEXT,
+                    edit_message_id=callback_mid,
+                    attachments=_prompt_cancel_keyboard("mst_cancel_instruction"),
+                )
+            elif payload == "mst_set_instruction_btn":
+                self.admin_states[sender_id] = AdminState.AWAITING_INSTRUCTION_BUTTON_TEXT
+                await self.replace_with_prompt_or_send(
+                    sender_id,
+                    rep.PROMPT_INSTRUCTION_BUTTON_TEXT,
+                    edit_message_id=callback_mid,
+                    attachments=_prompt_cancel_keyboard("mst_cancel_instruction"),
+                )
+            elif payload == "mst_toggle_instruction":
+                self.config.instruction_enabled = not self.config.instruction_enabled
+                self.config.save()
+                vis = rep.INSTRUCTION_VISIBLE_YES if self.config.instruction_enabled else rep.INSTRUCTION_VISIBLE_NO
+                await self.send_master_instruction_submenu(
+                    sender_id,
+                    edit_message_id=callback_mid,
+                    prepend=rep.INSTRUCTION_VISIBILITY_CHANGED.format(state=vis),
+                )
             return
 
         if not self.can_use_user_menu(sender_id):
@@ -2860,6 +3020,11 @@ class MaxBot:
             await self.send_user_menu(sender_id, edit_message_id=callback_mid)
         elif payload == "usr_channels":
             await self.send_channels_submenu(sender_id, edit_message_id=callback_mid)
+        elif payload == "usr_instruction":
+            if not self.config.instruction_enabled:
+                await self.send_user_menu(sender_id, edit_message_id=callback_mid)
+                return
+            await self.send_user_instruction_submenu(sender_id, edit_message_id=callback_mid)
         elif isinstance(payload, str) and payload.startswith("usr_ch_posts:"):
             rest = payload[len("usr_ch_posts:") :]
             parts = rest.split(":", 1)
