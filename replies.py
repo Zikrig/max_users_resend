@@ -174,8 +174,6 @@ POSTS_EMPTY = (
     "Обработанных постов для «{title}» пока нет (бот ещё не обрабатывал посты или записи старше 3 суток удалены)."
 )
 
-COMMENTS_POST_NAV_TEXT = "Ссылки к посту:"
-
 
 def posts_list_caption(title: str, page: int, max_page: int, total: int) -> str:
     return (
