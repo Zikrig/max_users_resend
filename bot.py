@@ -1512,6 +1512,76 @@ class MaxBot:
             copy_attachments.append({"type": "inline_keyboard", "payload": {"buttons": ad_buttons}})
         return copy_attachments
 
+    def build_comments_nav_attachments(self, binding: Dict[str, Any], message_link: str) -> List[Dict[str, Any]]:
+        buttons: List[List[Dict[str, Any]]] = []
+        nav_row: List[Dict[str, Any]] = []
+        comments_invite_link = str(binding.get("comments_chat_link", "")).strip()
+        if comments_invite_link:
+            nav_row.append({"type": "link", "text": self.config.comments_chat_text, "url": comments_invite_link})
+        if message_link and (self.config.comments_message_button_text or "").strip():
+            nav_row.append(
+                {
+                    "type": "link",
+                    "text": self.config.comments_message_button_text.strip(),
+                    "url": message_link,
+                }
+            )
+        if nav_row:
+            buttons.append(nav_row)
+        buttons.extend(self.get_standard_buttons(include_ad=True))
+        if not buttons:
+            return []
+        return [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+
+    async def forward_message_to_chat(
+        self,
+        source_chat_id: int,
+        message_id: str,
+        target_chat_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Пытаемся переслать сообщение «как у пользователя».
+        MAX API может отличаться по контракту между версиями, поэтому пробуем несколько безопасных форматов.
+        """
+        attempts: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = [
+            (
+                "/messages/forward",
+                {"chat_id": target_chat_id},
+                {"from_chat_id": source_chat_id, "message_id": message_id},
+            ),
+            (
+                "/messages/forward",
+                {},
+                {"from_chat_id": source_chat_id, "message_id": message_id, "chat_id": target_chat_id},
+            ),
+            (
+                "/messages/forward",
+                {"chat_id": target_chat_id},
+                {"source_chat_id": source_chat_id, "source_message_id": message_id},
+            ),
+        ]
+        for endpoint, params, payload in attempts:
+            try:
+                r = await self.client.post(endpoint, params=params, json=payload)
+                if r.status_code >= 400:
+                    logger.warning(
+                        "Forward attempt failed endpoint=%s status=%s body=%s",
+                        endpoint,
+                        r.status_code,
+                        r.text,
+                    )
+                    continue
+                data = r.json()
+                if isinstance(data, dict):
+                    msg = data.get("message")
+                    if isinstance(msg, dict):
+                        return msg
+                    if "body" in data:
+                        return data
+            except Exception as e:
+                logger.warning("Forward attempt error endpoint=%s: %s", endpoint, e)
+        return None
+
     async def apply_channel_post_text_edit(
         self,
         channel_id: int,
@@ -1735,20 +1805,23 @@ class MaxBot:
         chat_message_id = ""
         short_message_id = ""
         if comments_chat_id:
-            copy_attachments = self.build_comments_chat_copy_attachments(clean_attachments)
-
-            forwarded = await self.send_message(
-                comments_chat_id,
-                canon_text,
-                copy_attachments,
-                text_format=canon_tf,
-                markup=canon_mk,
-            )
+            forwarded: Optional[Dict[str, Any]] = None
+            if message_id and channel_id is not None:
+                forwarded = await self.forward_message_to_chat(channel_id, str(message_id), comments_chat_id)
+            if not forwarded:
+                # Fallback на старое поведение, если forward недоступен в API/окружении.
+                forwarded = await self.send_message(
+                    comments_chat_id,
+                    canon_text,
+                    clean_attachments,
+                    text_format=canon_tf,
+                    markup=canon_mk,
+                )
             if forwarded:
                 body = forwarded.get("body", {})
                 if isinstance(body, dict):
                     logger.info(
-                        "MAX channel_post: ответ POST /messages (копия в чат) ключи body=%s | разметка: %s",
+                        "MAX channel_post: сообщение в чате комментариев создано, keys body=%s | разметка: %s",
                         sorted(body.keys()),
                         json.dumps(format_debug_snapshot(body), ensure_ascii=False, default=str),
                     )
@@ -1761,31 +1834,23 @@ class MaxBot:
         if comments_chat_id and short_message_id:
             message_link = f"https://max.ru/c/{comments_chat_id}/{short_message_id}"
 
-        kb_att = self.build_channel_keyboard_attachment(binding, message_link)
-        channel_attachments = list(clean_attachments)
-        channel_attachments.extend(kb_att)
+        if comments_chat_id:
+            nav_attachments = self.build_comments_nav_attachments(binding, message_link)
+            if nav_attachments:
+                await self.send_message(comments_chat_id, rep.COMMENTS_POST_NAV_TEXT, nav_attachments)
 
-        if message_id:
-            ok = await self.edit_message(
-                message_id,
+        if message_id and channel_id is not None:
+            self.config.register_tracked_post(
+                int(channel_id),
+                str(message_id),
                 canon_text,
-                channel_attachments,
-                text_format=canon_tf,
-                markup=canon_mk,
-                log_api_response_as=f"process_channel_post channel mid={message_id}",
+                message_link,
+                chat_message_id=chat_message_id,
+                media_attachments=clean_attachments,
+                text_format=canon_tf if canon_tf is not None else "",
+                markup=canon_mk if canon_mk is not None else [],
             )
-            if ok and kb_att:
-                self.config.register_tracked_post(
-                    int(channel_id),
-                    str(message_id),
-                    canon_text,
-                    message_link,
-                    chat_message_id=chat_message_id,
-                    media_attachments=clean_attachments,
-                    text_format=canon_tf if canon_tf is not None else "",
-                    markup=canon_mk if canon_mk is not None else [],
-                )
-                self.config.save()
+            self.config.save()
 
     def _reset_fsm(self, sender_id: int) -> None:
         self.admin_states[sender_id] = AdminState.NONE
@@ -2557,7 +2622,6 @@ class MaxBot:
         ref = encode_post_ref(channel_id, message_id)
         msg_text = _menu_prepend(f"{rep.POST_DETAIL_PREFIX}{body}", prepend)
         buttons = [
-            [{"type": "callback", "text": rep.BTN_CHANGE_POST_TEXT, "payload": f"usr_post_edit:{ref}:{return_page}:{channel_id}"}],
             [{"type": "callback", "text": rep.BTN_CHANGE_POST_IMAGE, "payload": f"usr_post_edit_img:{ref}:{return_page}:{channel_id}"}],
             [{"type": "callback", "text": rep.BTN_BACK, "payload": f"usr_ch_posts:{channel_id}:{return_page}"}],
         ]
