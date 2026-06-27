@@ -12,6 +12,9 @@ services:
         HTTPS_PROXY: ${HTTPS_PROXY:-}
         NO_PROXY: ${NO_PROXY:-}
     restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 77.88.8.8
     env_file:
       - .env
     ports:

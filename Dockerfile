@@ -35,9 +35,16 @@ FROM python:3.12-slim
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && update-ca-certificates
+    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && mkdir -p /usr/local/share/ca-certificates/russian-trusted \
+    && wget -qO /usr/local/share/ca-certificates/russian-trusted/russian_trusted_root_ca_pem.crt \
+         https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt \
+    && wget -qO /usr/local/share/ca-certificates/russian-trusted/russian_trusted_sub_ca_pem.crt \
+         https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt \
+    && update-ca-certificates \
+    && apt-get purge -y wget \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
